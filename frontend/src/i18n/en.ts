@@ -97,6 +97,27 @@ export const en: Record<TranslationKey, string> = {
   "auth.error_generic": "Something went wrong. Check your details and try again.",
   "auth.close": "Close",
 
+  "auth.register_check_email": "We sent an email to {email} to confirm your account. Check your inbox (and spam) before logging in.",
+  "auth.resend_verification": "Resend verification email",
+  "auth.resend_sending": "Sending…",
+  "auth.resend_sent": "Done, check your inbox.",
+
+  "auth.forgot_link": "Forgot your password?",
+  "auth.forgot_title": "Recover password",
+  "auth.forgot_submit": "Send instructions",
+  "auth.forgot_sent": "If an account exists with that email, we sent instructions to reset your password.",
+
+  "auth.verify_title": "Account confirmation",
+  "auth.verify_pending": "Confirming your account…",
+  "auth.verify_success": "Your account is confirmed!",
+  "auth.verify_invalid_link": "This link is invalid or has expired.",
+  "auth.verify_go_home": "Go home",
+
+  "auth.reset_title": "Reset password",
+  "auth.reset_new_password": "New password",
+  "auth.reset_submit": "Save new password",
+  "auth.reset_success": "Your password was updated successfully.",
+
   "history.title": "My Trips",
   "history.empty": 'You haven\'t saved any trips yet. Plan one and use the "Save trip" button.',
   "history.status.planned": "Planned",

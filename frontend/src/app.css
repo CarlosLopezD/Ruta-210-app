@@ -600,6 +600,18 @@
   color: #7a5300;
 }
 
+.alert-success {
+  background: rgba(43, 138, 62, 0.1);
+  border: 1px solid rgba(43, 138, 62, 0.3);
+  color: #1f6b31;
+}
+
+.auth-page {
+  max-width: 420px;
+  margin: 64px auto;
+  padding: 0 16px;
+}
+
 /* --- Summary --- */
 
 .summary-grid {
@@ -985,6 +997,10 @@
 
 :root[data-theme="dark"] .alert-warning {
   color: #ffd98a;
+}
+
+:root[data-theme="dark"] .alert-success {
+  color: #8de3a0;
 }
 
 :root[data-theme="dark"] .status-control--in_progress .status-control__option.is-active {

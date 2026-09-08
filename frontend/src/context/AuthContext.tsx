@@ -5,6 +5,7 @@ import {
   login as apiLogin,
   register as apiRegister,
   refreshAccessToken,
+  logoutRequest,
   AuthApiError,
 } from "../api/authApi";
 import type { AuthUser } from "../api/authApi";
@@ -35,8 +36,8 @@ interface AuthContextValue {
   isAuthenticated: boolean;
   ready: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, displayName?: string) => Promise<void>;
-  logout: () => void;
+  register: (email: string, password: string, displayName?: string) => Promise<{ email: string }>;
+  logout: () => Promise<void>;
   authFetch: (path: string, options?: RequestInit) => Promise<Response>;
 }
 
@@ -84,9 +85,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     if (response.status === 401 && tokens.current.refresh) {
       try {
-        const { access } = await refreshAccessToken(tokens.current.refresh);
-        tokens.current = { ...tokens.current, access };
+        // Refresh tokens rotate server-side (SIMPLE_JWT.ROTATE_REFRESH_TOKENS):
+        // every use returns a NEW refresh token and blacklists the old one,
+        // so we must persist the one we get back or the *next* refresh fails.
+        const { access, refresh: rotated } = await refreshAccessToken(tokens.current.refresh);
+        tokens.current = { access, refresh: rotated ?? tokens.current.refresh };
         writeStorage(ACCESS_KEY, access);
+        if (rotated) writeStorage(REFRESH_KEY, rotated);
         response = await doFetch(access);
       } catch {
         clearSession();
@@ -137,13 +142,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
       async register(email, password, displayName) {
         try {
+          // Registering no longer logs the user in — the account needs email
+          // verification first (see accounts.views.RegisterView).
           const data = await apiRegister(email, password, displayName);
-          persistSession(data.access, data.refresh, data.user);
+          return { email: data.email };
         } catch (err) {
           throw err instanceof AuthApiError ? err : new AuthApiError("Register failed", 0);
         }
       },
-      logout: clearSession,
+      async logout() {
+        const refresh = tokens.current.refresh;
+        const access = tokens.current.access;
+        clearSession();
+        if (refresh) {
+          try {
+            await logoutRequest(refresh, access);
+          } catch {
+            // best-effort — the local session is already cleared either way
+          }
+        }
+      },
     }),
     [user, ready]
   );

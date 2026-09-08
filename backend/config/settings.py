@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "accounts",
     "trips",
@@ -121,12 +122,26 @@ REST_FRAMEWORK = {
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+    # Global default throttle is intentionally loose (protects against runaway
+    # scripts hitting the public /plan/ endpoint); the auth endpoints that are
+    # actual brute-force targets (login, register, verification, password
+    # reset) opt into the tighter "auth-*" scopes below via ScopedRateThrottle.
+    "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "120/min",
+        "auth-login": "10/min",
+        "auth-register": "5/min",
+        "auth-verify": "10/min",
+        "auth-password-reset": "5/min",
+    },
 }
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
-    "ROTATE_REFRESH_TOKENS": False,
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
 }
@@ -145,7 +160,35 @@ else:
 
 # --- Security (production) ---------------------------------------------------
 
+# Render (and most PaaS) terminate TLS at a proxy and forward plain HTTP
+# internally, tagging the original scheme in this header. Without it, Django
+# never sees the request as secure — request.is_secure() is always False,
+# which breaks SECURE_SSL_REDIRECT and the *_COOKIE_SECURE flags below.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+CORS_ALLOW_METHODS = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+
 if not DEBUG:
     SECURE_SSL_REDIRECT = os.environ.get("DJANGO_SECURE_SSL_REDIRECT", "True") == "True"
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
+    X_FRAME_OPTIONS = "DENY"
+    # HSTS: tells browsers to only ever hit this host over HTTPS, for a year,
+    # including subdomains. Skipped when DEBUG so local http:// dev is unaffected.
+    SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+# --- Transactional email (Resend) --------------------------------------------
+# Used for the email-verification and password-reset links. Without an API
+# key, emails are logged instead of sent (see accounts/emails.py) so
+# registration/reset still work end-to-end in local dev.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "Ruta 210 App <onboarding@resend.dev>")
+
+# Base URL of the deployed frontend — used to build the links inside those
+# emails (e.g. https://ruta-210-app.example.workers.dev/verificar-email?...).
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173").rstrip("/")

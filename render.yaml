@@ -22,3 +22,14 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: "3.11.15"
+      # Used to build the links inside verification/reset emails.
+      - key: FRONTEND_URL
+        value: "https://ruta-210-app.lcarlosdario2020.workers.dev"
+      # Resend API key (resend.com) for sending those emails — paste yours
+      # in the Render dashboard after the blueprint is created. Without it,
+      # emails are logged instead of sent (see backend/accounts/emails.py),
+      # so nothing breaks, but users won't actually receive them.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        value: "Ruta 210 App <onboarding@resend.dev>"

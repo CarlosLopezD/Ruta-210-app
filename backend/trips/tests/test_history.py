@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase
 
 from trips.models import Trip
@@ -27,8 +28,13 @@ SAMPLE_PLAN_RESULT = {
 
 class TripHistoryTests(TestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email="carlos@example.com", password="supersecreta123")
-        self.other_user = User.objects.create_user(email="other@example.com", password="supersecreta123")
+        cache.clear()  # throttle counters are process-global, not per-test
+        self.user = User.objects.create_user(
+            email="carlos@example.com", password="supersecreta123", is_email_verified=True
+        )
+        self.other_user = User.objects.create_user(
+            email="other@example.com", password="supersecreta123", is_email_verified=True
+        )
         login = self.client.post(
             "/api/auth/login/",
             data={"email": "carlos@example.com", "password": "supersecreta123"},

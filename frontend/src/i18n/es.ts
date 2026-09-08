@@ -95,6 +95,27 @@ export const es = {
   "auth.error_generic": "Ocurrió un error. Revisá los datos e intentá de nuevo.",
   "auth.close": "Cerrar",
 
+  "auth.register_check_email": "Te enviamos un email a {email} para confirmar tu cuenta. Revisá tu bandeja de entrada (y spam) antes de iniciar sesión.",
+  "auth.resend_verification": "Reenviar email de verificación",
+  "auth.resend_sending": "Enviando…",
+  "auth.resend_sent": "Listo, revisá tu bandeja de entrada.",
+
+  "auth.forgot_link": "¿Olvidaste tu contraseña?",
+  "auth.forgot_title": "Recuperar contraseña",
+  "auth.forgot_submit": "Enviar instrucciones",
+  "auth.forgot_sent": "Si existe una cuenta con ese email, te enviamos instrucciones para restablecer tu contraseña.",
+
+  "auth.verify_title": "Confirmación de cuenta",
+  "auth.verify_pending": "Confirmando tu cuenta…",
+  "auth.verify_success": "¡Tu cuenta quedó confirmada!",
+  "auth.verify_invalid_link": "Este enlace no es válido o ya venció.",
+  "auth.verify_go_home": "Ir al inicio",
+
+  "auth.reset_title": "Restablecer contraseña",
+  "auth.reset_new_password": "Nueva contraseña",
+  "auth.reset_submit": "Guardar nueva contraseña",
+  "auth.reset_success": "Tu contraseña se actualizó correctamente.",
+
   "history.title": "Mis viajes",
   "history.empty": "Todavía no guardaste ningún viaje. Planificá uno y usá el botón \"Guardar viaje\".",
   "history.status.planned": "A futuro",
