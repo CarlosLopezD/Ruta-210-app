@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: eld_trip_planner
+      POSTGRES_USER: eld_user
+      POSTGRES_PASSWORD: eld_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - eld_trip_planner_db_data:/var/lib/postgresql/data
+
+volumes:
+  eld_trip_planner_db_data:
