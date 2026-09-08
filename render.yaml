@@ -14,7 +14,7 @@ services:
       - key: DJANGO_ALLOWED_HOSTS
         value: "eld-trip-planner-api-wkzt.onrender.com"
       - key: CORS_ALLOWED_ORIGINS
-        value: "https://CHANGE-ME.pages.dev"
+        value: "https://ruta-210-app.lcarlosdario2020.workers.dev"
       # Free Postgres (Render's own free DB expires after ~30 days — use an
       # external provider such as Neon or Supabase and paste the connection
       # string here from the Render dashboard after the blueprint is created).
