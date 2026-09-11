@@ -1,0 +1,1662 @@
+From 3835f085cdfafd23cbe4b0ec80d3c772b558a45b Mon Sep 17 00:00:00 2001
+From: Carlos <lcarlosdario1516@gmail.com>
+Date: Tue, 8 Sep 2026 02:57:51 +0000
+Subject: [PATCH] =?UTF-8?q?Agregar=20capas=20de=20seguridad:=20verificaci?=
+ =?UTF-8?q?=C3=B3n=20de=20email,=20recuperaci=C3=B3n=20de=20contrase=C3=B1?=
+ =?UTF-8?q?a,=20rate=20limiting=20y=20bloqueo=20de=20cuenta?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Registro ahora exige confirmar el email antes de poder iniciar sesión
+  (token firmado, no se guarda en la base; el link se envía por Resend).
+- Flujo de "olvidé mi contraseña" completo (solicitud + confirmación),
+  con mensajes genéricos para no revelar si un email existe o no.
+- Rate limiting por endpoint en login/registro/verificación/reset
+  (DRF ScopedRateThrottle) y bloqueo progresivo de cuenta tras intentos
+  fallidos de login (15 min tras 5 intentos).
+- Logout invalida el refresh token (blacklist) y los refresh tokens
+  rotan en cada uso.
+- Hardening HTTP en producción: HSTS, X-Frame-Options, nosniff,
+  Referrer-Policy, y SECURE_PROXY_SSL_HEADER para el proxy TLS de Render.
+- Content-Security-Policy y otros headers de seguridad para el frontend
+  vía Cloudflare (_headers), acotados a los recursos reales que usa la app.
+- Nuevas páginas /verificar-email y /restablecer-contrasena, y UI de
+  AuthModal actualizada (reenvío de verificación, "olvidé mi contraseña").
+- 44/44 tests de backend en verde.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LwT3WHf7GgmbwuXZDBpEfc
+---
+ backend/accounts/emails.py                    |  73 +++++
+ ...ttempts_user_is_email_verified_and_more.py |  28 ++
+ backend/accounts/models.py                    |  25 ++
+ backend/accounts/serializers.py               |  90 ++++++-
+ backend/accounts/tests/test_auth.py           | 249 +++++++++++++++++-
+ backend/accounts/tokens.py                    |  25 ++
+ backend/accounts/urls.py                      |  16 +-
+ backend/accounts/views.py                     | 111 +++++++-
+ backend/config/settings.py                    |  45 +++-
+ backend/trips/tests/test_history.py           |  10 +-
+ frontend/public/_headers                      |   7 +
+ frontend/src/App.tsx                          |   4 +
+ frontend/src/api/authApi.ts                   |  86 ++++--
+ frontend/src/app.css                          |  16 ++
+ frontend/src/components/AuthModal.tsx         | 176 +++++++++----
+ frontend/src/context/AuthContext.tsx          |  30 ++-
+ frontend/src/i18n/en.ts                       |  21 ++
+ frontend/src/i18n/es.ts                       |  21 ++
+ frontend/src/pages/ResetPasswordPage.tsx      |  79 ++++++
+ frontend/src/pages/VerifyEmailPage.tsx        |  43 +++
+ render.yaml                                   |  11 +
+ 21 files changed, 1060 insertions(+), 106 deletions(-)
+ create mode 100644 backend/accounts/emails.py
+ create mode 100644 backend/accounts/migrations/0002_user_failed_login_attempts_user_is_email_verified_and_more.py
+ create mode 100644 backend/accounts/tokens.py
+ create mode 100644 frontend/public/_headers
+ create mode 100644 frontend/src/pages/ResetPasswordPage.tsx
+ create mode 100644 frontend/src/pages/VerifyEmailPage.tsx
+
+diff --git a/backend/accounts/emails.py b/backend/accounts/emails.py
+new file mode 100644
+index 0000000..44e04ec
+--- /dev/null
++++ b/backend/accounts/emails.py
+@@ -0,0 +1,73 @@
++"""Transactional email for the auth flows (verification, password reset).
++
++Sent through Resend's HTTP API (https://resend.com) — no SMTP setup needed,
++works from any host with outbound HTTPS. If RESEND_API_KEY isn't configured
++(e.g. local dev without a key), we log the email instead of sending it, so
++registration/reset still work end-to-end without a real provider.
++"""
++
++import logging
++
++import requests
++from django.conf import settings
++from django.utils.http import urlsafe_base64_encode
++from django.utils.encoding import force_bytes
++
++from .tokens import email_verification_token, password_reset_token
++
++logger = logging.getLogger(__name__)
++
++RESEND_ENDPOINT = "https://api.resend.com/emails"
++
++
++def _uidb64(user) -> str:
++    return urlsafe_base64_encode(force_bytes(user.pk))
++
++
++def _send(to_email: str, subject: str, html: str) -> None:
++    api_key = getattr(settings, "RESEND_API_KEY", "")
++    from_addr = getattr(settings, "EMAIL_FROM", "Ruta 210 App <onboarding@resend.dev>")
++
++    if not api_key:
++        # No provider configured (local dev, CI) — don't block the request,
++        # just make the email visible in the logs.
++        logger.info("Email not sent (no RESEND_API_KEY) — to=%s subject=%s\n%s", to_email, subject, html)
++        return
++
++    try:
++        response = requests.post(
++            RESEND_ENDPOINT,
++            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
++            json={"from": from_addr, "to": [to_email], "subject": subject, "html": html},
++            timeout=10,
++        )
++        if response.status_code >= 400:
++            logger.error("Resend API error %s: %s", response.status_code, response.text)
++    except requests.RequestException:
++        logger.exception("Failed to send email to %s", to_email)
++
++
++def send_verification_email(user) -> None:
++    uid = _uidb64(user)
++    token = email_verification_token.make_token(user)
++    link = f"{settings.FRONTEND_URL}/verificar-email?uid={uid}&token={token}"
++    html = f"""
++      <p>Hola{f' {user.display_name}' if user.display_name else ''},</p>
++      <p>Confirmá tu email para activar tu cuenta en Ruta 210 App:</p>
++      <p><a href="{link}">{link}</a></p>
++      <p>Si no creaste esta cuenta, podés ignorar este mensaje.</p>
++    """
++    _send(user.email, "Confirmá tu cuenta — Ruta 210 App", html)
++
++
++def send_password_reset_email(user) -> None:
++    uid = _uidb64(user)
++    token = password_reset_token.make_token(user)
++    link = f"{settings.FRONTEND_URL}/restablecer-contrasena?uid={uid}&token={token}"
++    html = f"""
++      <p>Hola{f' {user.display_name}' if user.display_name else ''},</p>
++      <p>Pediste restablecer tu contraseña en Ruta 210 App. Este link vence en 24&nbsp;horas:</p>
++      <p><a href="{link}">{link}</a></p>
++      <p>Si no fuiste vos, ignorá este mensaje — tu contraseña actual sigue funcionando.</p>
++    """
++    _send(user.email, "Restablecer contraseña — Ruta 210 App", html)
+diff --git a/backend/accounts/migrations/0002_user_failed_login_attempts_user_is_email_verified_and_more.py b/backend/accounts/migrations/0002_user_failed_login_attempts_user_is_email_verified_and_more.py
+new file mode 100644
+index 0000000..7369ee0
+--- /dev/null
++++ b/backend/accounts/migrations/0002_user_failed_login_attempts_user_is_email_verified_and_more.py
+@@ -0,0 +1,28 @@
++# Generated by Django 5.2.17 on 2026-09-08 02:39
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ("accounts", "0001_initial"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="user",
++            name="failed_login_attempts",
++            field=models.PositiveIntegerField(default=0),
++        ),
++        migrations.AddField(
++            model_name="user",
++            name="is_email_verified",
++            field=models.BooleanField(default=False),
++        ),
++        migrations.AddField(
++            model_name="user",
++            name="locked_until",
++            field=models.DateTimeField(blank=True, null=True),
++        ),
++    ]
+diff --git a/backend/accounts/models.py b/backend/accounts/models.py
+index 1e2ec56..cf78607 100644
+--- a/backend/accounts/models.py
++++ b/backend/accounts/models.py
+@@ -1,8 +1,14 @@
++from datetime import timedelta
++
+ from django.contrib.auth.models import AbstractUser
+ from django.db import models
++from django.utils import timezone
+ 
+ from .managers import UserManager
+ 
++MAX_FAILED_LOGIN_ATTEMPTS = 5
++LOCKOUT_DURATION = timedelta(minutes=15)
++
+ 
+ class User(AbstractUser):
+     """Custom user: logs in with email, no public username."""
+@@ -11,6 +17,10 @@ class User(AbstractUser):
+     email = models.EmailField(unique=True)
+     display_name = models.CharField(max_length=150, blank=True)
+ 
++    is_email_verified = models.BooleanField(default=False)
++    failed_login_attempts = models.PositiveIntegerField(default=0)
++    locked_until = models.DateTimeField(null=True, blank=True)
++
+     USERNAME_FIELD = "email"
+     REQUIRED_FIELDS = []
+ 
+@@ -18,3 +28,18 @@ class User(AbstractUser):
+ 
+     def __str__(self) -> str:
+         return self.email
++
++    def is_locked(self) -> bool:
++        return bool(self.locked_until and self.locked_until > timezone.now())
++
++    def register_failed_login(self) -> None:
++        self.failed_login_attempts += 1
++        if self.failed_login_attempts >= MAX_FAILED_LOGIN_ATTEMPTS:
++            self.locked_until = timezone.now() + LOCKOUT_DURATION
++        self.save(update_fields=["failed_login_attempts", "locked_until"])
++
++    def reset_failed_logins(self) -> None:
++        if self.failed_login_attempts or self.locked_until:
++            self.failed_login_attempts = 0
++            self.locked_until = None
++            self.save(update_fields=["failed_login_attempts", "locked_until"])
+diff --git a/backend/accounts/serializers.py b/backend/accounts/serializers.py
+index c06b5c6..4d6a2d1 100644
+--- a/backend/accounts/serializers.py
++++ b/backend/accounts/serializers.py
+@@ -1,15 +1,19 @@
+ from django.contrib.auth import get_user_model
+ from django.contrib.auth.password_validation import validate_password
+-from rest_framework import serializers
++from django.utils.encoding import force_str
++from django.utils.http import urlsafe_base64_decode
++from rest_framework import exceptions, serializers
+ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+ 
++from .tokens import email_verification_token, password_reset_token
++
+ User = get_user_model()
+ 
+ 
+ class UserSerializer(serializers.ModelSerializer):
+     class Meta:
+         model = User
+-        fields = ["id", "email", "display_name"]
++        fields = ["id", "email", "display_name", "is_email_verified"]
+ 
+ 
+ class RegisterSerializer(serializers.ModelSerializer):
+@@ -30,10 +34,86 @@ class RegisterSerializer(serializers.ModelSerializer):
+ 
+ 
+ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
+-    """SimpleJWT's default serializer already uses USERNAME_FIELD (email, here) —
+-    this subclass just adds the user's data to the token response."""
++    """Adds account-lockout and email-verification checks on top of
++    SimpleJWT's default (already generic — "no active account found with
++    the given credentials" — error, which we keep to avoid leaking whether
++    an email is registered)."""
+ 
+     def validate(self, attrs):
+-        data = super().validate(attrs)
++        email = (attrs.get("email") or "").strip().lower()
++        user = User.objects.filter(email__iexact=email).first()
++
++        if user and user.is_locked():
++            raise serializers.ValidationError(
++                {
++                    "detail": "Cuenta bloqueada temporalmente por demasiados intentos fallidos. Probá de nuevo en unos minutos.",
++                    "code": "account_locked",
++                }
++            )
++
++        try:
++            data = super().validate(attrs)
++        except exceptions.AuthenticationFailed:
++            if user:
++                user.register_failed_login()
++            raise
++
++        if user:
++            user.reset_failed_logins()
++
++        if not self.user.is_email_verified:
++            raise serializers.ValidationError(
++                {
++                    "detail": "Confirmá tu email antes de iniciar sesión. Revisá tu bandeja de entrada.",
++                    "code": "email_not_verified",
++                }
++            )
++
+         data["user"] = UserSerializer(self.user).data
+         return data
++
++
++class EmailVerifySerializer(serializers.Serializer):
++    uid = serializers.CharField()
++    token = serializers.CharField()
++
++    def validate(self, attrs):
++        try:
++            pk = force_str(urlsafe_base64_decode(attrs["uid"]))
++            user = User.objects.get(pk=pk)
++        except (User.DoesNotExist, ValueError, TypeError, OverflowError):
++            raise serializers.ValidationError("Enlace inválido o expirado.")
++
++        if not email_verification_token.check_token(user, attrs["token"]):
++            raise serializers.ValidationError("Enlace inválido o expirado.")
++
++        attrs["user"] = user
++        return attrs
++
++
++class ResendVerificationSerializer(serializers.Serializer):
++    email = serializers.EmailField()
++
++
++class PasswordResetRequestSerializer(serializers.Serializer):
++    email = serializers.EmailField()
++
++
++class PasswordResetConfirmSerializer(serializers.Serializer):
++    uid = serializers.CharField()
++    token = serializers.CharField()
++    new_password = serializers.CharField(write_only=True)
++
++    def validate(self, attrs):
++        try:
++            pk = force_str(urlsafe_base64_decode(attrs["uid"]))
++            user = User.objects.get(pk=pk)
++        except (User.DoesNotExist, ValueError, TypeError, OverflowError):
++            raise serializers.ValidationError("Enlace inválido o expirado.")
++
++        if not password_reset_token.check_token(user, attrs["token"]):
++            raise serializers.ValidationError("Enlace inválido o expirado.")
++
++        validate_password(attrs["new_password"], user=user)
++        attrs["user"] = user
++        return attrs
+diff --git a/backend/accounts/tests/test_auth.py b/backend/accounts/tests/test_auth.py
+index 7cf39bf..c41a69f 100644
+--- a/backend/accounts/tests/test_auth.py
++++ b/backend/accounts/tests/test_auth.py
+@@ -1,11 +1,24 @@
+ from django.contrib.auth import get_user_model
++from django.core.cache import cache
+ from django.test import TestCase
++from django.utils.encoding import force_bytes
++from django.utils.http import urlsafe_base64_encode
++
++from accounts.models import MAX_FAILED_LOGIN_ATTEMPTS
++from accounts.tokens import email_verification_token, password_reset_token
+ 
+ User = get_user_model()
+ 
+ 
++def _uidb64(user):
++    return urlsafe_base64_encode(force_bytes(user.pk))
++
++
+ class RegisterTests(TestCase):
+-    def test_register_creates_user_and_returns_tokens(self):
++    def setUp(self):
++        cache.clear()  # throttle counters are process-global, not per-test
++
++    def test_register_creates_unverified_user_no_tokens(self):
+         response = self.client.post(
+             "/api/auth/register/",
+             data={"email": "carlos@example.com", "password": "supersecreta123", "display_name": "Carlos"},
+@@ -13,10 +26,12 @@ class RegisterTests(TestCase):
+         )
+         self.assertEqual(response.status_code, 201)
+         body = response.json()
+-        self.assertIn("access", body)
+-        self.assertIn("refresh", body)
+-        self.assertEqual(body["user"]["email"], "carlos@example.com")
+-        self.assertTrue(User.objects.filter(email="carlos@example.com").exists())
++        # No tokens on register anymore — the account must be verified first.
++        self.assertNotIn("access", body)
++        self.assertNotIn("refresh", body)
++        self.assertEqual(body["email"], "carlos@example.com")
++        user = User.objects.get(email="carlos@example.com")
++        self.assertFalse(user.is_email_verified)
+ 
+     def test_register_duplicate_email_returns_400(self):
+         User.objects.create_user(email="dup@example.com", password="supersecreta123")
+@@ -38,7 +53,10 @@ class RegisterTests(TestCase):
+ 
+ class LoginTests(TestCase):
+     def setUp(self):
+-        self.user = User.objects.create_user(email="login@example.com", password="supersecreta123")
++        cache.clear()  # throttle counters are process-global, not per-test
++        self.user = User.objects.create_user(
++            email="login@example.com", password="supersecreta123", is_email_verified=True
++        )
+ 
+     def test_login_with_correct_credentials(self):
+         response = self.client.post(
+@@ -60,10 +78,56 @@ class LoginTests(TestCase):
+         )
+         self.assertEqual(response.status_code, 401)
+ 
++    def test_login_blocked_until_email_verified(self):
++        User.objects.create_user(email="unverified@example.com", password="supersecreta123")
++        response = self.client.post(
++            "/api/auth/login/",
++            data={"email": "unverified@example.com", "password": "supersecreta123"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("email_not_verified", response.json()["code"])
++
++    def test_account_locks_after_repeated_failed_logins(self):
++        for _ in range(MAX_FAILED_LOGIN_ATTEMPTS):
++            self.client.post(
++                "/api/auth/login/",
++                data={"email": "login@example.com", "password": "incorrecta"},
++                content_type="application/json",
++            )
++        self.user.refresh_from_db()
++        self.assertTrue(self.user.is_locked())
++
++        # Even the correct password is now rejected while locked.
++        response = self.client.post(
++            "/api/auth/login/",
++            data={"email": "login@example.com", "password": "supersecreta123"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("account_locked", response.json()["code"])
++
++    def test_successful_login_resets_failed_attempts(self):
++        self.client.post(
++            "/api/auth/login/",
++            data={"email": "login@example.com", "password": "incorrecta"},
++            content_type="application/json",
++        )
++        self.client.post(
++            "/api/auth/login/",
++            data={"email": "login@example.com", "password": "supersecreta123"},
++            content_type="application/json",
++        )
++        self.user.refresh_from_db()
++        self.assertEqual(self.user.failed_login_attempts, 0)
++
+ 
+ class MeTests(TestCase):
+     def setUp(self):
+-        self.user = User.objects.create_user(email="me@example.com", password="supersecreta123")
++        cache.clear()
++        self.user = User.objects.create_user(
++            email="me@example.com", password="supersecreta123", is_email_verified=True
++        )
+ 
+     def _access_token(self):
+         response = self.client.post(
+@@ -82,3 +146,174 @@ class MeTests(TestCase):
+         response = self.client.get("/api/auth/me/", HTTP_AUTHORIZATION=f"Bearer {token}")
+         self.assertEqual(response.status_code, 200)
+         self.assertEqual(response.json()["email"], "me@example.com")
++
++
++class EmailVerificationTests(TestCase):
++    def setUp(self):
++        cache.clear()
++        self.user = User.objects.create_user(email="verify@example.com", password="supersecreta123")
++
++    def test_valid_token_verifies_account(self):
++        token = email_verification_token.make_token(self.user)
++        response = self.client.post(
++            "/api/auth/verify-email/",
++            data={"uid": _uidb64(self.user), "token": token},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 200)
++        self.user.refresh_from_db()
++        self.assertTrue(self.user.is_email_verified)
++
++    def test_invalid_token_rejected(self):
++        response = self.client.post(
++            "/api/auth/verify-email/",
++            data={"uid": _uidb64(self.user), "token": "not-a-real-token"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 400)
++
++    def test_token_cannot_be_reused_after_verification(self):
++        token = email_verification_token.make_token(self.user)
++        self.client.post(
++            "/api/auth/verify-email/",
++            data={"uid": _uidb64(self.user), "token": token},
++            content_type="application/json",
++        )
++        # Same token, second attempt — is_email_verified is now part of the
++        # token's hash, so it should no longer validate.
++        response = self.client.post(
++            "/api/auth/verify-email/",
++            data={"uid": _uidb64(self.user), "token": token},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 400)
++
++    def test_resend_verification_is_generic_for_unknown_email(self):
++        response = self.client.post(
++            "/api/auth/resend-verification/",
++            data={"email": "doesnotexist@example.com"},
++            content_type="application/json",
++        )
++        # Same 200 + generic message whether or not the email exists, so the
++        # endpoint can't be used to enumerate registered accounts.
++        self.assertEqual(response.status_code, 200)
++
++
++class PasswordResetTests(TestCase):
++    def setUp(self):
++        cache.clear()
++        self.user = User.objects.create_user(
++            email="reset@example.com", password="oldpassword123", is_email_verified=True
++        )
++
++    def test_request_is_generic_for_unknown_email(self):
++        response = self.client.post(
++            "/api/auth/password-reset/",
++            data={"email": "unknown@example.com"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 200)
++
++    def test_confirm_with_valid_token_changes_password(self):
++        token = password_reset_token.make_token(self.user)
++        response = self.client.post(
++            "/api/auth/password-reset/confirm/",
++            data={"uid": _uidb64(self.user), "token": token, "new_password": "brandnewpass123"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 200)
++        self.user.refresh_from_db()
++        self.assertTrue(self.user.check_password("brandnewpass123"))
++
++    def test_confirm_with_invalid_token_rejected(self):
++        response = self.client.post(
++            "/api/auth/password-reset/confirm/",
++            data={"uid": _uidb64(self.user), "token": "bogus", "new_password": "brandnewpass123"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 400)
++        self.user.refresh_from_db()
++        self.assertTrue(self.user.check_password("oldpassword123"))
++
++    def test_confirm_with_weak_password_rejected(self):
++        token = password_reset_token.make_token(self.user)
++        response = self.client.post(
++            "/api/auth/password-reset/confirm/",
++            data={"uid": _uidb64(self.user), "token": token, "new_password": "123"},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 400)
++
++
++class LogoutTests(TestCase):
++    def setUp(self):
++        cache.clear()
++        self.user = User.objects.create_user(
++            email="logout@example.com", password="supersecreta123", is_email_verified=True
++        )
++        login = self.client.post(
++            "/api/auth/login/",
++            data={"email": "logout@example.com", "password": "supersecreta123"},
++            content_type="application/json",
++        )
++        self.tokens = login.json()
++
++    def test_logout_blacklists_refresh_token(self):
++        response = self.client.post(
++            "/api/auth/logout/",
++            data={"refresh": self.tokens["refresh"]},
++            content_type="application/json",
++            HTTP_AUTHORIZATION=f"Bearer {self.tokens['access']}",
++        )
++        self.assertEqual(response.status_code, 205)
++
++        # The blacklisted refresh token can no longer mint new access tokens.
++        refresh_response = self.client.post(
++            "/api/auth/refresh/",
++            data={"refresh": self.tokens["refresh"]},
++            content_type="application/json",
++        )
++        self.assertEqual(refresh_response.status_code, 401)
++
++    def test_logout_requires_auth(self):
++        response = self.client.post(
++            "/api/auth/logout/",
++            data={"refresh": self.tokens["refresh"]},
++            content_type="application/json",
++        )
++        self.assertEqual(response.status_code, 401)
++
++
++class ThrottlingTests(TestCase):
++    """Confirms the login endpoint actually enforces its configured rate
++    limit (settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["auth-login"]).
++
++    DRF's SimpleRateThrottle reads its rate table once at class-definition
++    time, so @override_settings can't lower it for a test — this exercises
++    the real configured "10/min" instead of trying to fake a smaller one.
++    """
++
++    def setUp(self):
++        cache.clear()
++
++    def test_login_is_rate_limited_per_ip(self):
++        from rest_framework.throttling import ScopedRateThrottle
++
++        limit, _ = ScopedRateThrottle().parse_rate(
++            ScopedRateThrottle.THROTTLE_RATES["auth-login"]
++        )
++
++        def attempt():
++            # A nonexistent email so this exercises throttling in isolation —
++            # no matching user means the account-lockout layer never engages
++            # (there's nothing to lock), so every pre-limit response is a
++            # plain 401 rather than switching to a lockout 400 partway through.
++            return self.client.post(
++                "/api/auth/login/",
++                data={"email": "nobody@example.com", "password": "wrong"},
++                content_type="application/json",
++            )
++
++        statuses = [attempt().status_code for _ in range(limit + 1)]
++        self.assertTrue(all(s == 401 for s in statuses[:limit]), statuses)
++        self.assertEqual(statuses[limit], 429)
+diff --git a/backend/accounts/tokens.py b/backend/accounts/tokens.py
+new file mode 100644
+index 0000000..2b57d52
+--- /dev/null
++++ b/backend/accounts/tokens.py
+@@ -0,0 +1,25 @@
++"""Token generators for the email-verification and password-reset flows.
++
++Both build on Django's PasswordResetTokenGenerator (HMAC of a hash value +
++timestamp, no DB storage needed), so tokens self-expire after
++settings.PASSWORD_RESET_TIMEOUT seconds and can't be reused once the state
++they were issued for changes.
++"""
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator, default_token_generator
++
++
++class EmailVerificationTokenGenerator(PasswordResetTokenGenerator):
++    """Like the password-reset generator, but keyed off is_email_verified
++    instead of the password hash, so it works before the user ever has a
++    session and stops validating once the address has been confirmed."""
++
++    def _make_hash_value(self, user, timestamp):
++        return f"{user.pk}{user.is_email_verified}{timestamp}"
++
++
++email_verification_token = EmailVerificationTokenGenerator()
++
++# Password resets reuse Django's own generator (keyed off the password hash
++# and last_login, so a token is invalidated the moment it's used).
++password_reset_token = default_token_generator
+diff --git a/backend/accounts/urls.py b/backend/accounts/urls.py
+index eb1d67b..d1ffdf0 100644
+--- a/backend/accounts/urls.py
++++ b/backend/accounts/urls.py
+@@ -1,11 +1,25 @@
+ from django.urls import path
+ from rest_framework_simplejwt.views import TokenRefreshView
+ 
+-from .views import LoginView, MeView, RegisterView
++from .views import (
++    LoginView,
++    LogoutView,
++    MeView,
++    PasswordResetConfirmView,
++    PasswordResetRequestView,
++    RegisterView,
++    ResendVerificationView,
++    VerifyEmailView,
++)
+ 
+ urlpatterns = [
+     path("register/", RegisterView.as_view(), name="auth-register"),
+     path("login/", LoginView.as_view(), name="auth-login"),
++    path("logout/", LogoutView.as_view(), name="auth-logout"),
+     path("refresh/", TokenRefreshView.as_view(), name="auth-refresh"),
+     path("me/", MeView.as_view(), name="auth-me"),
++    path("verify-email/", VerifyEmailView.as_view(), name="auth-verify-email"),
++    path("resend-verification/", ResendVerificationView.as_view(), name="auth-resend-verification"),
++    path("password-reset/", PasswordResetRequestView.as_view(), name="auth-password-reset"),
++    path("password-reset/confirm/", PasswordResetConfirmView.as_view(), name="auth-password-reset-confirm"),
+ ]
+diff --git a/backend/accounts/views.py b/backend/accounts/views.py
+index 930d4f8..9768caa 100644
+--- a/backend/accounts/views.py
++++ b/backend/accounts/views.py
+@@ -1,36 +1,133 @@
+-from rest_framework import generics, permissions
++from rest_framework import generics, permissions, status
+ from rest_framework.response import Response
++from rest_framework.throttling import ScopedRateThrottle
+ from rest_framework.views import APIView
++from rest_framework_simplejwt.exceptions import TokenError
+ from rest_framework_simplejwt.tokens import RefreshToken
+ from rest_framework_simplejwt.views import TokenObtainPairView
+ 
+-from .serializers import EmailTokenObtainPairSerializer, RegisterSerializer, UserSerializer
++from .emails import send_password_reset_email, send_verification_email
++from .serializers import (
++    EmailTokenObtainPairSerializer,
++    EmailVerifySerializer,
++    PasswordResetConfirmSerializer,
++    PasswordResetRequestSerializer,
++    RegisterSerializer,
++    ResendVerificationSerializer,
++    UserSerializer,
++)
++from .models import User
++
++GENERIC_RESET_MESSAGE = "Si existe una cuenta con ese email, te enviamos un correo con instrucciones."
++GENERIC_RESEND_MESSAGE = "Si existe una cuenta con ese email y todavía no fue verificada, te reenviamos el correo."
+ 
+ 
+ class LoginView(TokenObtainPairView):
+     serializer_class = EmailTokenObtainPairSerializer
+     permission_classes = [permissions.AllowAny]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-login"
+ 
+ 
+ class RegisterView(generics.CreateAPIView):
+     serializer_class = RegisterSerializer
+     permission_classes = [permissions.AllowAny]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-register"
+ 
+     def create(self, request, *args, **kwargs):
+         serializer = self.get_serializer(data=request.data)
+         serializer.is_valid(raise_exception=True)
+         user = serializer.save()
+-        refresh = RefreshToken.for_user(user)
++        send_verification_email(user)
+         return Response(
+             {
+-                "access": str(refresh.access_token),
+-                "refresh": str(refresh),
+-                "user": UserSerializer(user).data,
++                "detail": "Cuenta creada. Revisá tu email para confirmarla antes de iniciar sesión.",
++                "email": user.email,
+             },
+-            status=201,
++            status=status.HTTP_201_CREATED,
+         )
+ 
+ 
++class VerifyEmailView(generics.GenericAPIView):
++    serializer_class = EmailVerifySerializer
++    permission_classes = [permissions.AllowAny]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-verify"
++
++    def post(self, request):
++        serializer = self.get_serializer(data=request.data)
++        serializer.is_valid(raise_exception=True)
++        user = serializer.validated_data["user"]
++        if not user.is_email_verified:
++            user.is_email_verified = True
++            user.save(update_fields=["is_email_verified"])
++        return Response(UserSerializer(user).data)
++
++
++class ResendVerificationView(generics.GenericAPIView):
++    serializer_class = ResendVerificationSerializer
++    permission_classes = [permissions.AllowAny]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-verify"
++
++    def post(self, request):
++        serializer = self.get_serializer(data=request.data)
++        serializer.is_valid(raise_exception=True)
++        email = serializer.validated_data["email"].strip().lower()
++        user = User.objects.filter(email__iexact=email, is_email_verified=False).first()
++        if user:
++            send_verification_email(user)
++        return Response({"detail": GENERIC_RESEND_MESSAGE})
++
++
++class PasswordResetRequestView(generics.GenericAPIView):
++    serializer_class = PasswordResetRequestSerializer
++    permission_classes = [permissions.AllowAny]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-password-reset"
++
++    def post(self, request):
++        serializer = self.get_serializer(data=request.data)
++        serializer.is_valid(raise_exception=True)
++        email = serializer.validated_data["email"].strip().lower()
++        user = User.objects.filter(email__iexact=email).first()
++        if user:
++            send_password_reset_email(user)
++        return Response({"detail": GENERIC_RESET_MESSAGE})
++
++
++class PasswordResetConfirmView(generics.GenericAPIView):
++    serializer_class = PasswordResetConfirmSerializer
++    permission_classes = [permissions.AllowAny]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-password-reset"
++
++    def post(self, request):
++        serializer = self.get_serializer(data=request.data)
++        serializer.is_valid(raise_exception=True)
++        user = serializer.validated_data["user"]
++        user.set_password(serializer.validated_data["new_password"])
++        user.reset_failed_logins()
++        user.save()
++        return Response({"detail": "Contraseña actualizada. Ya podés iniciar sesión."})
++
++
++class LogoutView(APIView):
++    permission_classes = [permissions.IsAuthenticated]
++    throttle_classes = [ScopedRateThrottle]
++    throttle_scope = "auth-login"
++
++    def post(self, request):
++        refresh = request.data.get("refresh")
++        if refresh:
++            try:
++                RefreshToken(refresh).blacklist()
++            except TokenError:
++                pass  # already invalid/expired/blacklisted — logout still "succeeds"
++        return Response(status=status.HTTP_205_RESET_CONTENT)
++
++
+ class MeView(APIView):
+     permission_classes = [permissions.IsAuthenticated]
+ 
+diff --git a/backend/config/settings.py b/backend/config/settings.py
+index 1aa4168..1b1b0ff 100644
+--- a/backend/config/settings.py
++++ b/backend/config/settings.py
+@@ -38,6 +38,7 @@ INSTALLED_APPS = [
+     "django.contrib.staticfiles",
+     "rest_framework",
+     "rest_framework_simplejwt",
++    "rest_framework_simplejwt.token_blacklist",
+     "corsheaders",
+     "accounts",
+     "trips",
+@@ -121,12 +122,26 @@ REST_FRAMEWORK = {
+         "rest_framework_simplejwt.authentication.JWTAuthentication",
+     ],
+     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
++    # Global default throttle is intentionally loose (protects against runaway
++    # scripts hitting the public /plan/ endpoint); the auth endpoints that are
++    # actual brute-force targets (login, register, verification, password
++    # reset) opt into the tighter "auth-*" scopes below via ScopedRateThrottle.
++    "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
++    "DEFAULT_THROTTLE_RATES": {
++        "anon": "120/min",
++        "auth-login": "10/min",
++        "auth-register": "5/min",
++        "auth-verify": "10/min",
++        "auth-password-reset": "5/min",
++    },
+ }
+ 
+ SIMPLE_JWT = {
+     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
+     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+-    "ROTATE_REFRESH_TOKENS": False,
++    "ROTATE_REFRESH_TOKENS": True,
++    "BLACKLIST_AFTER_ROTATION": True,
++    "UPDATE_LAST_LOGIN": True,
+     "AUTH_HEADER_TYPES": ("Bearer",),
+     "USER_ID_FIELD": "id",
+ }
+@@ -145,7 +160,35 @@ else:
+ 
+ # --- Security (production) ---------------------------------------------------
+ 
++# Render (and most PaaS) terminate TLS at a proxy and forward plain HTTP
++# internally, tagging the original scheme in this header. Without it, Django
++# never sees the request as secure — request.is_secure() is always False,
++# which breaks SECURE_SSL_REDIRECT and the *_COOKIE_SECURE flags below.
++SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
++
++CORS_ALLOW_METHODS = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
++
+ if not DEBUG:
+     SECURE_SSL_REDIRECT = os.environ.get("DJANGO_SECURE_SSL_REDIRECT", "True") == "True"
+     SESSION_COOKIE_SECURE = True
+     CSRF_COOKIE_SECURE = True
++    SESSION_COOKIE_HTTPONLY = True
++    SECURE_CONTENT_TYPE_NOSNIFF = True
++    SECURE_REFERRER_POLICY = "same-origin"
++    X_FRAME_OPTIONS = "DENY"
++    # HSTS: tells browsers to only ever hit this host over HTTPS, for a year,
++    # including subdomains. Skipped when DEBUG so local http:// dev is unaffected.
++    SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", "31536000"))
++    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
++    SECURE_HSTS_PRELOAD = True
++
++# --- Transactional email (Resend) --------------------------------------------
++# Used for the email-verification and password-reset links. Without an API
++# key, emails are logged instead of sent (see accounts/emails.py) so
++# registration/reset still work end-to-end in local dev.
++RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
++EMAIL_FROM = os.environ.get("EMAIL_FROM", "Ruta 210 App <onboarding@resend.dev>")
++
++# Base URL of the deployed frontend — used to build the links inside those
++# emails (e.g. https://ruta-210-app.example.workers.dev/verificar-email?...).
++FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+diff --git a/backend/trips/tests/test_history.py b/backend/trips/tests/test_history.py
+index ab955dd..5b98014 100644
+--- a/backend/trips/tests/test_history.py
++++ b/backend/trips/tests/test_history.py
+@@ -1,4 +1,5 @@
+ from django.contrib.auth import get_user_model
++from django.core.cache import cache
+ from django.test import TestCase
+ 
+ from trips.models import Trip
+@@ -27,8 +28,13 @@ SAMPLE_PLAN_RESULT = {
+ 
+ class TripHistoryTests(TestCase):
+     def setUp(self):
+-        self.user = User.objects.create_user(email="carlos@example.com", password="supersecreta123")
+-        self.other_user = User.objects.create_user(email="other@example.com", password="supersecreta123")
++        cache.clear()  # throttle counters are process-global, not per-test
++        self.user = User.objects.create_user(
++            email="carlos@example.com", password="supersecreta123", is_email_verified=True
++        )
++        self.other_user = User.objects.create_user(
++            email="other@example.com", password="supersecreta123", is_email_verified=True
++        )
+         login = self.client.post(
+             "/api/auth/login/",
+             data={"email": "carlos@example.com", "password": "supersecreta123"},
+diff --git a/frontend/public/_headers b/frontend/public/_headers
+new file mode 100644
+index 0000000..3d41b66
+--- /dev/null
++++ b/frontend/public/_headers
+@@ -0,0 +1,7 @@
++/*
++  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'; connect-src 'self' https://eld-trip-planner-api-wkzt.onrender.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'
++  Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
++  X-Frame-Options: DENY
++  X-Content-Type-Options: nosniff
++  Referrer-Policy: strict-origin-when-cross-origin
++  Permissions-Policy: geolocation=(), camera=(), microphone=()
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index e4e3aae..ab6700e 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -7,6 +7,8 @@ import { AuthProvider } from "./context/AuthContext";
+ import Header from "./components/Header";
+ import PlannerPage from "./pages/PlannerPage";
+ import HistoryPage from "./pages/HistoryPage";
++import VerifyEmailPage from "./pages/VerifyEmailPage";
++import ResetPasswordPage from "./pages/ResetPasswordPage";
+ 
+ export default function App() {
+   return (
+@@ -19,6 +21,8 @@ export default function App() {
+               <Routes>
+                 <Route path="/" element={<PlannerPage />} />
+                 <Route path="/mis-viajes" element={<HistoryPage />} />
++                <Route path="/verificar-email" element={<VerifyEmailPage />} />
++                <Route path="/restablecer-contrasena" element={<ResetPasswordPage />} />
+               </Routes>
+             </div>
+           </BrowserRouter>
+diff --git a/frontend/src/api/authApi.ts b/frontend/src/api/authApi.ts
+index 4da5437..b144a45 100644
+--- a/frontend/src/api/authApi.ts
++++ b/frontend/src/api/authApi.ts
+@@ -4,6 +4,7 @@ export interface AuthUser {
+   id: number;
+   email: string;
+   display_name: string;
++  is_email_verified: boolean;
+ }
+ 
+ export interface AuthResponse {
+@@ -12,60 +13,95 @@ export interface AuthResponse {
+   user: AuthUser;
+ }
+ 
++export interface RegisterResponse {
++  detail: string;
++  email: string;
++}
++
+ export class AuthApiError extends Error {
+   status: number;
+-  constructor(message: string, status: number) {
++  code?: string;
++  constructor(message: string, status: number, code?: string) {
+     super(message);
+     this.status = status;
++    this.code = code;
+   }
+ }
+ 
+-async function parseErrorMessage(response: Response): Promise<string> {
++// DRF wraps a field's errors in an array when it bubbles up through a
++// serializer's validate() — accept both "value" and ["value"] shapes.
++function firstOrSelf(value: unknown): string | undefined {
++  if (Array.isArray(value)) return typeof value[0] === "string" ? value[0] : undefined;
++  return typeof value === "string" ? value : undefined;
++}
++
++async function parseError(response: Response): Promise<AuthApiError> {
+   try {
+     const body = await response.json();
+-    if (typeof body?.detail === "string") return body.detail;
+-    if (typeof body?.error === "string") return body.error;
++    const code = firstOrSelf(body?.code);
++    const detail = firstOrSelf(body?.detail) ?? firstOrSelf(body?.error);
++    if (detail) return new AuthApiError(detail, response.status, code);
+     if (body && typeof body === "object") {
+       const parts = Object.entries(body).map(([field, errors]) => {
+         const text = Array.isArray(errors) ? errors.join(", ") : String(errors);
+         return `${field}: ${text}`;
+       });
+-      if (parts.length) return parts.join(" — ");
++      if (parts.length) return new AuthApiError(parts.join(" — "), response.status, code);
+     }
+   } catch {
+-    // ignore
++    // ignore — fall through to the generic message below
+   }
+-  return `Error ${response.status}`;
++  return new AuthApiError(`Error ${response.status}`, response.status);
+ }
+ 
+-export async function login(email: string, password: string): Promise<AuthResponse> {
+-  const response = await fetch(`${API_BASE_URL}/api/auth/login/`, {
++async function postJson<T>(path: string, payload: unknown): Promise<T> {
++  const response = await fetch(`${API_BASE_URL}${path}`, {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+-    body: JSON.stringify({ email, password }),
++    body: JSON.stringify(payload),
+   });
+-  if (!response.ok) throw new AuthApiError(await parseErrorMessage(response), response.status);
++  if (!response.ok) throw await parseError(response);
++  if (response.status === 205) return undefined as T;
+   return response.json();
+ }
+ 
+-export async function register(email: string, password: string, display_name?: string): Promise<AuthResponse> {
+-  const response = await fetch(`${API_BASE_URL}/api/auth/register/`, {
+-    method: "POST",
+-    headers: { "Content-Type": "application/json" },
+-    body: JSON.stringify({ email, password, display_name: display_name ?? "" }),
+-  });
+-  if (!response.ok) throw new AuthApiError(await parseErrorMessage(response), response.status);
+-  return response.json();
++export function login(email: string, password: string): Promise<AuthResponse> {
++  return postJson("/api/auth/login/", { email, password });
++}
++
++export function register(email: string, password: string, display_name?: string): Promise<RegisterResponse> {
++  return postJson("/api/auth/register/", { email, password, display_name: display_name ?? "" });
++}
++
++export function refreshAccessToken(refresh: string): Promise<{ access: string; refresh?: string }> {
++  return postJson("/api/auth/refresh/", { refresh });
+ }
+ 
+-export async function refreshAccessToken(refresh: string): Promise<{ access: string }> {
+-  const response = await fetch(`${API_BASE_URL}/api/auth/refresh/`, {
++export function logoutRequest(refresh: string, accessToken: string | null): Promise<void> {
++  return fetch(`${API_BASE_URL}/api/auth/logout/`, {
+     method: "POST",
+-    headers: { "Content-Type": "application/json" },
++    headers: {
++      "Content-Type": "application/json",
++      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
++    },
+     body: JSON.stringify({ refresh }),
+-  });
+-  if (!response.ok) throw new AuthApiError(await parseErrorMessage(response), response.status);
+-  return response.json();
++  }).then(() => undefined); // best-effort — logout clears the local session either way
++}
++
++export function verifyEmail(uid: string, token: string): Promise<AuthUser> {
++  return postJson("/api/auth/verify-email/", { uid, token });
++}
++
++export function resendVerification(email: string): Promise<{ detail: string }> {
++  return postJson("/api/auth/resend-verification/", { email });
++}
++
++export function requestPasswordReset(email: string): Promise<{ detail: string }> {
++  return postJson("/api/auth/password-reset/", { email });
++}
++
++export function confirmPasswordReset(uid: string, token: string, new_password: string): Promise<{ detail: string }> {
++  return postJson("/api/auth/password-reset/confirm/", { uid, token, new_password });
+ }
+ 
+ export { API_BASE_URL };
+diff --git a/frontend/src/app.css b/frontend/src/app.css
+index d65d973..e6ea991 100644
+--- a/frontend/src/app.css
++++ b/frontend/src/app.css
+@@ -600,6 +600,18 @@
+   color: #7a5300;
+ }
+ 
++.alert-success {
++  background: rgba(43, 138, 62, 0.1);
++  border: 1px solid rgba(43, 138, 62, 0.3);
++  color: #1f6b31;
++}
++
++.auth-page {
++  max-width: 420px;
++  margin: 64px auto;
++  padding: 0 16px;
++}
++
+ /* --- Summary --- */
+ 
+ .summary-grid {
+@@ -987,6 +999,10 @@
+   color: #ffd98a;
+ }
+ 
++:root[data-theme="dark"] .alert-success {
++  color: #8de3a0;
++}
++
+ :root[data-theme="dark"] .status-control--in_progress .status-control__option.is-active {
+   color: #2a1c00;
+ }
+diff --git a/frontend/src/components/AuthModal.tsx b/frontend/src/components/AuthModal.tsx
+index 0bf9d3b..eebbce9 100644
+--- a/frontend/src/components/AuthModal.tsx
++++ b/frontend/src/components/AuthModal.tsx
+@@ -2,7 +2,7 @@ import { useState } from "react";
+ import type { FormEvent } from "react";
+ import { useAuth } from "../context/AuthContext";
+ import { useTranslation } from "../context/LanguageContext";
+-import { AuthApiError } from "../api/authApi";
++import { AuthApiError, resendVerification, requestPasswordReset } from "../api/authApi";
+ 
+ interface Props {
+   initialMode?: "login" | "register";
+@@ -10,97 +10,169 @@ interface Props {
+   onSuccess?: () => void;
+ }
+ 
++type Mode = "login" | "register" | "forgot";
++
+ export default function AuthModal({ initialMode = "login", onClose, onSuccess }: Props) {
+   const { login, register } = useAuth();
+   const { t } = useTranslation();
+-  const [mode, setMode] = useState<"login" | "register">(initialMode);
++  const [mode, setMode] = useState<Mode>(initialMode);
+   const [email, setEmail] = useState("");
+   const [password, setPassword] = useState("");
+   const [displayName, setDisplayName] = useState("");
+   const [error, setError] = useState<string | null>(null);
++  const [errorCode, setErrorCode] = useState<string | undefined>(undefined);
+   const [loading, setLoading] = useState(false);
++  const [resendState, setResendState] = useState<"idle" | "sending" | "sent">("idle");
++  // Set once register/forgot-password succeed — swaps the form for a plain
++  // confirmation message instead of closing the modal (there's nothing to
++  // log into yet: the account still needs email confirmation).
++  const [successMessage, setSuccessMessage] = useState<string | null>(null);
++
++  function switchMode(next: Mode) {
++    setError(null);
++    setErrorCode(undefined);
++    setSuccessMessage(null);
++    setResendState("idle");
++    setMode(next);
++  }
+ 
+   async function handleSubmit(event: FormEvent) {
+     event.preventDefault();
+     setError(null);
++    setErrorCode(undefined);
+     setLoading(true);
+     try {
+       if (mode === "login") {
+         await login(email, password);
++        onSuccess?.();
++        onClose();
++      } else if (mode === "register") {
++        const result = await register(email, password, displayName);
++        setSuccessMessage(t("auth.register_check_email").replace("{email}", result.email));
+       } else {
+-        await register(email, password, displayName);
++        await requestPasswordReset(email);
++        // Generic message regardless of whether the account exists — the
++        // backend deliberately doesn't reveal that (see accounts/views.py).
++        setSuccessMessage(t("auth.forgot_sent"));
+       }
+-      onSuccess?.();
+-      onClose();
+     } catch (err) {
+-      setError(err instanceof AuthApiError ? err.message : t("auth.error_generic"));
++      if (err instanceof AuthApiError) {
++        setError(err.message);
++        setErrorCode(err.code);
++      } else {
++        setError(t("auth.error_generic"));
++      }
+     } finally {
+       setLoading(false);
+     }
+   }
+ 
++  async function handleResend() {
++    setResendState("sending");
++    try {
++      await resendVerification(email);
++    } catch {
++      // the endpoint itself never errors on a known/unknown email — a
++      // network failure here is the only realistic case, ignore it quietly
++    } finally {
++      setResendState("sent");
++    }
++  }
++
++  const title =
++    mode === "login" ? t("auth.login_title") : mode === "register" ? t("auth.register_title") : t("auth.forgot_title");
++
+   return (
+     <div className="modal-backdrop" onClick={onClose}>
+       <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+         <div className="modal-card__header">
+-          <h2>{mode === "login" ? t("auth.login_title") : t("auth.register_title")}</h2>
++          <h2>{title}</h2>
+           <button type="button" className="icon-btn" onClick={onClose} aria-label={t("auth.close")}>
+             ✕
+           </button>
+         </div>
+ 
+-        <form className="trip-form" onSubmit={handleSubmit}>
+-          {error && <div className="alert alert-error">{error}</div>}
+-
+-          <div className="field">
+-            <label htmlFor="auth-email">{t("auth.email")}</label>
+-            <input
+-              id="auth-email"
+-              type="email"
+-              required
+-              autoFocus
+-              value={email}
+-              onChange={(e) => setEmail(e.target.value)}
+-            />
++        {successMessage ? (
++          <div className="trip-form">
++            <div className="alert alert-success">{successMessage}</div>
++            <button type="button" className="btn btn-primary" onClick={onClose}>
++              {t("auth.close")}
++            </button>
+           </div>
++        ) : (
++          <form className="trip-form" onSubmit={handleSubmit}>
++            {error && (
++              <div className="alert alert-error">
++                {error}
++                {errorCode === "email_not_verified" && (
++                  <div style={{ marginTop: "0.5rem" }}>
++                    {resendState === "sent" ? (
++                      <span>{t("auth.resend_sent")}</span>
++                    ) : (
++                      <button type="button" className="link-btn" onClick={handleResend} disabled={resendState === "sending"}>
++                        {resendState === "sending" ? t("auth.resend_sending") : t("auth.resend_verification")}
++                      </button>
++                    )}
++                  </div>
++                )}
++              </div>
++            )}
+ 
+-          {mode === "register" && (
+             <div className="field">
+-              <label htmlFor="auth-name">{t("auth.display_name")}</label>
+-              <input id="auth-name" type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
++              <label htmlFor="auth-email">{t("auth.email")}</label>
++              <input
++                id="auth-email"
++                type="email"
++                required
++                autoFocus
++                value={email}
++                onChange={(e) => setEmail(e.target.value)}
++              />
+             </div>
+-          )}
+ 
+-          <div className="field">
+-            <label htmlFor="auth-password">{t("auth.password")}</label>
+-            <input
+-              id="auth-password"
+-              type="password"
+-              required
+-              minLength={8}
+-              value={password}
+-              onChange={(e) => setPassword(e.target.value)}
+-            />
+-          </div>
++            {mode === "register" && (
++              <div className="field">
++                <label htmlFor="auth-name">{t("auth.display_name")}</label>
++                <input id="auth-name" type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
++              </div>
++            )}
+ 
+-          <div className="trip-form__actions">
+-            <button type="submit" className="btn btn-primary" disabled={loading}>
+-              {loading && <span className="spinner" />}
+-              {mode === "login" ? t("auth.login_submit") : t("auth.register_submit")}
+-            </button>
+-          </div>
++            {mode !== "forgot" && (
++              <div className="field">
++                <label htmlFor="auth-password">{t("auth.password")}</label>
++                <input
++                  id="auth-password"
++                  type="password"
++                  required
++                  minLength={8}
++                  value={password}
++                  onChange={(e) => setPassword(e.target.value)}
++                />
++              </div>
++            )}
+ 
+-          <button
+-            type="button"
+-            className="link-btn"
+-            onClick={() => {
+-              setError(null);
+-              setMode(mode === "login" ? "register" : "login");
+-            }}
+-          >
+-            {mode === "login" ? t("auth.switch_to_register") : t("auth.switch_to_login")}
+-          </button>
+-        </form>
++            <div className="trip-form__actions">
++              <button type="submit" className="btn btn-primary" disabled={loading}>
++                {loading && <span className="spinner" />}
++                {mode === "login"
++                  ? t("auth.login_submit")
++                  : mode === "register"
++                    ? t("auth.register_submit")
++                    : t("auth.forgot_submit")}
++              </button>
++            </div>
++
++            {mode === "login" && (
++              <button type="button" className="link-btn" onClick={() => switchMode("forgot")}>
++                {t("auth.forgot_link")}
++              </button>
++            )}
++
++            <button type="button" className="link-btn" onClick={() => switchMode(mode === "login" ? "register" : "login")}>
++              {mode === "register" ? t("auth.switch_to_login") : mode === "forgot" ? t("auth.switch_to_login") : t("auth.switch_to_register")}
++            </button>
++          </form>
++        )}
+       </div>
+     </div>
+   );
+diff --git a/frontend/src/context/AuthContext.tsx b/frontend/src/context/AuthContext.tsx
+index 271c1cc..4ea3091 100644
+--- a/frontend/src/context/AuthContext.tsx
++++ b/frontend/src/context/AuthContext.tsx
+@@ -5,6 +5,7 @@ import {
+   login as apiLogin,
+   register as apiRegister,
+   refreshAccessToken,
++  logoutRequest,
+   AuthApiError,
+ } from "../api/authApi";
+ import type { AuthUser } from "../api/authApi";
+@@ -35,8 +36,8 @@ interface AuthContextValue {
+   isAuthenticated: boolean;
+   ready: boolean;
+   login: (email: string, password: string) => Promise<void>;
+-  register: (email: string, password: string, displayName?: string) => Promise<void>;
+-  logout: () => void;
++  register: (email: string, password: string, displayName?: string) => Promise<{ email: string }>;
++  logout: () => Promise<void>;
+   authFetch: (path: string, options?: RequestInit) => Promise<Response>;
+ }
+ 
+@@ -84,9 +85,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+ 
+     if (response.status === 401 && tokens.current.refresh) {
+       try {
+-        const { access } = await refreshAccessToken(tokens.current.refresh);
+-        tokens.current = { ...tokens.current, access };
++        // Refresh tokens rotate server-side (SIMPLE_JWT.ROTATE_REFRESH_TOKENS):
++        // every use returns a NEW refresh token and blacklists the old one,
++        // so we must persist the one we get back or the *next* refresh fails.
++        const { access, refresh: rotated } = await refreshAccessToken(tokens.current.refresh);
++        tokens.current = { access, refresh: rotated ?? tokens.current.refresh };
+         writeStorage(ACCESS_KEY, access);
++        if (rotated) writeStorage(REFRESH_KEY, rotated);
+         response = await doFetch(access);
+       } catch {
+         clearSession();
+@@ -137,13 +142,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+       },
+       async register(email, password, displayName) {
+         try {
++          // Registering no longer logs the user in — the account needs email
++          // verification first (see accounts.views.RegisterView).
+           const data = await apiRegister(email, password, displayName);
+-          persistSession(data.access, data.refresh, data.user);
++          return { email: data.email };
+         } catch (err) {
+           throw err instanceof AuthApiError ? err : new AuthApiError("Register failed", 0);
+         }
+       },
+-      logout: clearSession,
++      async logout() {
++        const refresh = tokens.current.refresh;
++        const access = tokens.current.access;
++        clearSession();
++        if (refresh) {
++          try {
++            await logoutRequest(refresh, access);
++          } catch {
++            // best-effort — the local session is already cleared either way
++          }
++        }
++      },
+     }),
+     [user, ready]
+   );
+diff --git a/frontend/src/i18n/en.ts b/frontend/src/i18n/en.ts
+index 67aff2c..608566c 100644
+--- a/frontend/src/i18n/en.ts
++++ b/frontend/src/i18n/en.ts
+@@ -97,6 +97,27 @@ export const en: Record<TranslationKey, string> = {
+   "auth.error_generic": "Something went wrong. Check your details and try again.",
+   "auth.close": "Close",
+ 
++  "auth.register_check_email": "We sent an email to {email} to confirm your account. Check your inbox (and spam) before logging in.",
++  "auth.resend_verification": "Resend verification email",
++  "auth.resend_sending": "Sending…",
++  "auth.resend_sent": "Done, check your inbox.",
++
++  "auth.forgot_link": "Forgot your password?",
++  "auth.forgot_title": "Recover password",
++  "auth.forgot_submit": "Send instructions",
++  "auth.forgot_sent": "If an account exists with that email, we sent instructions to reset your password.",
++
++  "auth.verify_title": "Account confirmation",
++  "auth.verify_pending": "Confirming your account…",
++  "auth.verify_success": "Your account is confirmed!",
++  "auth.verify_invalid_link": "This link is invalid or has expired.",
++  "auth.verify_go_home": "Go home",
++
++  "auth.reset_title": "Reset password",
++  "auth.reset_new_password": "New password",
++  "auth.reset_submit": "Save new password",
++  "auth.reset_success": "Your password was updated successfully.",
++
+   "history.title": "My Trips",
+   "history.empty": 'You haven\'t saved any trips yet. Plan one and use the "Save trip" button.',
+   "history.status.planned": "Planned",
+diff --git a/frontend/src/i18n/es.ts b/frontend/src/i18n/es.ts
+index bdd5813..5af89b8 100644
+--- a/frontend/src/i18n/es.ts
++++ b/frontend/src/i18n/es.ts
+@@ -95,6 +95,27 @@ export const es = {
+   "auth.error_generic": "Ocurrió un error. Revisá los datos e intentá de nuevo.",
+   "auth.close": "Cerrar",
+ 
++  "auth.register_check_email": "Te enviamos un email a {email} para confirmar tu cuenta. Revisá tu bandeja de entrada (y spam) antes de iniciar sesión.",
++  "auth.resend_verification": "Reenviar email de verificación",
++  "auth.resend_sending": "Enviando…",
++  "auth.resend_sent": "Listo, revisá tu bandeja de entrada.",
++
++  "auth.forgot_link": "¿Olvidaste tu contraseña?",
++  "auth.forgot_title": "Recuperar contraseña",
++  "auth.forgot_submit": "Enviar instrucciones",
++  "auth.forgot_sent": "Si existe una cuenta con ese email, te enviamos instrucciones para restablecer tu contraseña.",
++
++  "auth.verify_title": "Confirmación de cuenta",
++  "auth.verify_pending": "Confirmando tu cuenta…",
++  "auth.verify_success": "¡Tu cuenta quedó confirmada!",
++  "auth.verify_invalid_link": "Este enlace no es válido o ya venció.",
++  "auth.verify_go_home": "Ir al inicio",
++
++  "auth.reset_title": "Restablecer contraseña",
++  "auth.reset_new_password": "Nueva contraseña",
++  "auth.reset_submit": "Guardar nueva contraseña",
++  "auth.reset_success": "Tu contraseña se actualizó correctamente.",
++
+   "history.title": "Mis viajes",
+   "history.empty": "Todavía no guardaste ningún viaje. Planificá uno y usá el botón \"Guardar viaje\".",
+   "history.status.planned": "A futuro",
+diff --git a/frontend/src/pages/ResetPasswordPage.tsx b/frontend/src/pages/ResetPasswordPage.tsx
+new file mode 100644
+index 0000000..a573aeb
+--- /dev/null
++++ b/frontend/src/pages/ResetPasswordPage.tsx
+@@ -0,0 +1,79 @@
++import { useState } from "react";
++import type { FormEvent } from "react";
++import { Link, useSearchParams } from "react-router-dom";
++import { confirmPasswordReset, AuthApiError } from "../api/authApi";
++import { useTranslation } from "../context/LanguageContext";
++
++export default function ResetPasswordPage() {
++  const { t } = useTranslation();
++  const [params] = useSearchParams();
++  const uid = params.get("uid");
++  const token = params.get("token");
++
++  const [password, setPassword] = useState("");
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [done, setDone] = useState(false);
++
++  async function handleSubmit(event: FormEvent) {
++    event.preventDefault();
++    if (!uid || !token) return;
++    setLoading(true);
++    setError(null);
++    try {
++      await confirmPasswordReset(uid, token, password);
++      setDone(true);
++    } catch (err) {
++      setError(err instanceof AuthApiError ? err.message : t("auth.error_generic"));
++    } finally {
++      setLoading(false);
++    }
++  }
++
++  if (!uid || !token) {
++    return (
++      <div className="auth-page">
++        <h1>{t("auth.reset_title")}</h1>
++        <div className="alert alert-error">{t("auth.verify_invalid_link")}</div>
++      </div>
++    );
++  }
++
++  if (done) {
++    return (
++      <div className="auth-page">
++        <h1>{t("auth.reset_title")}</h1>
++        <div className="alert alert-success">
++          {t("auth.reset_success")} <Link to="/">{t("auth.verify_go_home")}</Link>
++        </div>
++      </div>
++    );
++  }
++
++  return (
++    <div className="auth-page">
++      <h1>{t("auth.reset_title")}</h1>
++      <form className="trip-form" onSubmit={handleSubmit}>
++        {error && <div className="alert alert-error">{error}</div>}
++        <div className="field">
++          <label htmlFor="reset-password">{t("auth.reset_new_password")}</label>
++          <input
++            id="reset-password"
++            type="password"
++            required
++            minLength={8}
++            autoFocus
++            value={password}
++            onChange={(e) => setPassword(e.target.value)}
++          />
++        </div>
++        <div className="trip-form__actions">
++          <button type="submit" className="btn btn-primary" disabled={loading}>
++            {loading && <span className="spinner" />}
++            {t("auth.reset_submit")}
++          </button>
++        </div>
++      </form>
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/VerifyEmailPage.tsx b/frontend/src/pages/VerifyEmailPage.tsx
+new file mode 100644
+index 0000000..63fac2a
+--- /dev/null
++++ b/frontend/src/pages/VerifyEmailPage.tsx
+@@ -0,0 +1,43 @@
++import { useEffect, useState } from "react";
++import { Link, useSearchParams } from "react-router-dom";
++import { verifyEmail, AuthApiError } from "../api/authApi";
++import { useTranslation } from "../context/LanguageContext";
++
++type Status = "verifying" | "success" | "error";
++
++export default function VerifyEmailPage() {
++  const { t } = useTranslation();
++  const [params] = useSearchParams();
++  const [status, setStatus] = useState<Status>("verifying");
++  const [message, setMessage] = useState<string | null>(null);
++
++  useEffect(() => {
++    const uid = params.get("uid");
++    const token = params.get("token");
++    if (!uid || !token) {
++      setStatus("error");
++      setMessage(t("auth.verify_invalid_link"));
++      return;
++    }
++    verifyEmail(uid, token)
++      .then(() => setStatus("success"))
++      .catch((err) => {
++        setStatus("error");
++        setMessage(err instanceof AuthApiError ? err.message : t("auth.verify_invalid_link"));
++      });
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  return (
++    <div className="auth-page">
++      <h1>{t("auth.verify_title")}</h1>
++      {status === "verifying" && <p>{t("auth.verify_pending")}</p>}
++      {status === "success" && (
++        <div className="alert alert-success">
++          {t("auth.verify_success")} <Link to="/">{t("auth.verify_go_home")}</Link>
++        </div>
++      )}
++      {status === "error" && <div className="alert alert-error">{message}</div>}
++    </div>
++  );
++}
+diff --git a/render.yaml b/render.yaml
+index 2f5a268..08d4639 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -22,3 +22,14 @@ services:
+         sync: false
+       - key: PYTHON_VERSION
+         value: "3.11.15"
++      # Used to build the links inside verification/reset emails.
++      - key: FRONTEND_URL
++        value: "https://ruta-210-app.lcarlosdario2020.workers.dev"
++      # Resend API key (resend.com) for sending those emails — paste yours
++      # in the Render dashboard after the blueprint is created. Without it,
++      # emails are logged instead of sent (see backend/accounts/emails.py),
++      # so nothing breaks, but users won't actually receive them.
++      - key: RESEND_API_KEY
++        sync: false
++      - key: EMAIL_FROM
++        value: "Ruta 210 App <onboarding@resend.dev>"
+-- 
+2.43.0
+
