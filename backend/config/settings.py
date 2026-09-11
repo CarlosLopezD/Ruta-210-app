@@ -8,20 +8,29 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
-import dj_database_url
 from dotenv import load_dotenv
+
+from .env_checks import resolve_database_config, resolve_secret_key
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get(
-    "DJANGO_SECRET_KEY",
-    "django-insecure-&bkk7l1nb9rz0ltk4*bv3urq&#!c70hkr7sj$srruitlk()e_k",
-)
-
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
+# Defaults to False (fail closed) — DEBUG is only ever True when something
+# explicitly opts in, either backend/.env (local dev, copied from
+# .env.example) or an env var. A misconfigured production deploy that forgot
+# to set DJANGO_DEBUG=False stays safe instead of silently exposing debug info.
+DEBUG = os.environ.get("DJANGO_DEBUG", "False") == "True"
+
+# SECURITY WARNING: keep the secret key used in production secret!
+# See config/env_checks.py — in production, forgetting to set
+# DJANGO_SECRET_KEY now fails loudly at startup instead of silently running
+# with a hardcoded key that's sitting in this public repo.
+SECRET_KEY = resolve_secret_key(
+    env_value=os.environ.get("DJANGO_SECRET_KEY"),
+    debug=DEBUG,
+    dev_fallback="django-insecure-&bkk7l1nb9rz0ltk4*bv3urq&#!c70hkr7sj$srruitlk()e_k",
+)
 
 ALLOWED_HOSTS = [
     h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()
@@ -80,17 +89,16 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Database
 # Uses Postgres when DATABASE_URL is set (docker-compose locally, a managed
 # Postgres like Neon/Supabase in production); falls back to a local SQLite
-# file otherwise so the project still runs with zero extra setup.
-_database_url = os.environ.get("DATABASE_URL")
-if _database_url:
-    DATABASES = {"default": dj_database_url.parse(_database_url, conn_max_age=600)}
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
-    }
+# file only in DEBUG, so the project still runs with zero extra setup locally.
+# In production (DEBUG=False), a missing DATABASE_URL now fails startup
+# instead of silently falling back to SQLite on disk — see config/env_checks.py.
+DATABASES = {
+    "default": resolve_database_config(
+        database_url=os.environ.get("DATABASE_URL"),
+        debug=DEBUG,
+        sqlite_path=BASE_DIR / "db.sqlite3",
+    )
+}
 
 
 AUTH_PASSWORD_VALIDATORS = [

@@ -10,7 +10,7 @@ from __future__ import annotations
 import requests
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "eld-trip-planner-assessment/1.0 (contact: lcarlosdario1516@gmail.com)"
+USER_AGENT = "ruta-210-app/1.0 (+https://ruta-210-app.lcarlosdario2020.workers.dev)"
 TIMEOUT_SECONDS = 10
 
 

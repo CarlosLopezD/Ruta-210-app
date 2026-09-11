@@ -69,6 +69,11 @@ personal.
   cualquier horario del día (como el campo "Remarks" de una hoja ELD en
   papel), tanto en un viaje recién planificado como en uno ya guardado en tu
   historial; en un viaje guardado, cada anotación se persiste al instante.
+- **Verificación de email + recuperación de contraseña** — el registro exige
+  confirmar el email antes de poder iniciar sesión (con reenvío del link de
+  confirmación), y hay un flujo de "olvidé mi contraseña" por email. Login
+  con rate limiting por IP y bloqueo temporal de la cuenta tras intentos
+  fallidos repetidos.
 
 ## Estructura del proyecto
 
@@ -97,7 +102,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # los defaults andan bien — corre en SQLite sin configurar nada
 python manage.py migrate
-python manage.py test        # 30 tests: motor HOS, API de viajes, auth, historial
+python manage.py test        # 53 tests: motor HOS, API de viajes, auth, historial, config
 python manage.py runserver 8000
 ```
 
@@ -174,10 +179,30 @@ todos opcionales — omitilos para obtener el comportamiento anterior (arranca
 stops, daily_logs } Errores: `400` por input inválido, `502`
 si falla geocoding/ruteo.
 
-**Auth**:
-- `POST /api/auth/register/` — `{ email, password, display_name? }` → tokens + user.
-- `POST /api/auth/login/` — `{ email, password }` → tokens + user.
-- `POST /api/auth/refresh/` — `{ refresh }` → nuevo access token.
+**Auth**: el registro ya no inicia sesión automáticamente — la cuenta queda
+sin verificar hasta que el usuario confirma el email, y el login rechaza
+cuentas no verificadas. También hay bloqueo temporal tras varios intentos
+fallidos de login y rate limiting por IP en todos los endpoints de auth.
+
+- `POST /api/auth/register/` — `{ email, password, display_name? }` → `201`
+  con `{ detail, email }` (sin tokens) y dispara el email de verificación.
+- `POST /api/auth/verify-email/` — `{ uid, token }` (del link del email) →
+  marca la cuenta como verificada y devuelve el usuario.
+- `POST /api/auth/resend-verification/` — `{ email }` → reenvía el email de
+  verificación si la cuenta existe y todavía no está verificada. Responde
+  `200` con un mensaje genérico en ambos casos (no revela si el email existe).
+- `POST /api/auth/login/` — `{ email, password }` → tokens + user. `401` por
+  credenciales inválidas; `400` con `code: "email_not_verified"` si la cuenta
+  no confirmó su email, o `code: "account_locked"` tras 5 intentos fallidos
+  (bloqueo de 15 minutos).
+- `POST /api/auth/refresh/` — `{ refresh }` → nuevo access token (los refresh
+  tokens rotan: cada uso invalida el anterior y devuelve uno nuevo).
+- `POST /api/auth/logout/` — `{ refresh }` (requiere `Authorization: Bearer
+  <access>`) → invalida (blacklist) el refresh token.
+- `POST /api/auth/password-reset/` — `{ email }` → envía un link de reset si
+  la cuenta existe. Mismo mensaje genérico que `resend-verification`.
+- `POST /api/auth/password-reset/confirm/` — `{ uid, token, new_password }` →
+  actualiza la contraseña y desbloquea la cuenta si estaba bloqueada.
 - `GET /api/auth/me/` — usuario actual (requiere `Authorization: Bearer <access>`).
 
 **Historial de viajes** (todos requieren `Authorization: Bearer <access>`,
@@ -205,26 +230,42 @@ todos scoped al usuario autenticado):
   de ejercicio.
 - Si no se indica una fecha/hora de inicio, el viaje se asume que **arranca
   a las 00:00 del Día 1**.
-- **Sin `DATABASE_URL` seteada en producción, el historial de viajes vive en
-  el disco local del backend** — anda bien para desarrollo local (archivo
-  SQLite), pero la mayoría de los hosts gratuitos (Render incluido) borran
-  ese disco en cada redeploy. Seteá `DATABASE_URL` a una instancia real de
-  Postgres para un historial que realmente persista
+- **SQLite es solo para desarrollo local** (`DJANGO_DEBUG=True`) — corre en
+  un archivo en disco, sin setup extra. En producción (`DJANGO_DEBUG=False`)
+  el backend ahora **exige** `DATABASE_URL` y no arranca sin ella, en vez de
+  caer silenciosamente a un SQLite que la mayoría de los hosts gratuitos
+  (Render incluido) borran en cada redeploy.
 - Los access tokens JWT duran 60 minutos, los refresh tokens 7 días; no hay
   "recordarme" / sesión de más larga duración que eso.
 
 ## Tests
 
+Backend (53 tests):
+
 ```bash
 cd backend && source .venv/bin/activate && python manage.py test -v 2
 ```
 
-30 tests: 14 para el motor HOS + la API de planificación (viajes de un día
-vs. multi-día, el tope de 11 horas de manejo, paradas de combustible cada
-≤1.000 millas, el reset de 70 horas del ciclo, duración configurable de
-carga/descarga, hora de inicio opcional), 7 de auth (register/login/me,
-validaciones), y 9 de historial de
-viajes (guardar/listar/actualizar status/borrar/actualizar anotaciones y —
-lo más importante — que un usuario nunca puede ver ni modificar los viajes
-de otro, anotaciones incluidas). Los tests de backend mockean
-geocoding/ruteo para correr offline y de forma determinística.
+23 para el motor HOS + la API de planificación y el historial de viajes
+(viajes de un día vs. multi-día, el tope de 11 horas de manejo, paradas de
+combustible cada ≤1.000 millas, el reset de 70 horas del ciclo, duración
+configurable de carga/descarga, hora de inicio opcional, guardar/listar/
+actualizar status/borrar/actualizar anotaciones y — lo más importante — que
+un usuario nunca puede ver ni modificar los viajes de otro), 21 de auth
+(register/login/me/logout, verificación de email, recuperación de
+contraseña, bloqueo de cuenta tras intentos fallidos, rate limiting), y 9
+que confirman que el arranque en producción falla explícito si falta
+`DJANGO_SECRET_KEY` o `DATABASE_URL` en vez de usar un fallback inseguro o
+silencioso. Los tests mockean geocoding/ruteo para correr offline y de
+forma determinística.
+
+Frontend:
+
+```bash
+cd frontend && npm test -- --run
+```
+
+Tests de componentes (Vitest + Testing Library) para el modal de
+autenticación: login, registro, verificación pendiente, reenvío de
+verificación y recuperación de contraseña, incluyendo los mensajes de error
+genéricos vs. los específicos que devuelve la API.
