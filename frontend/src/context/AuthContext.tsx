@@ -6,7 +6,6 @@ import {
   register as apiRegister,
   refreshAccessToken,
   logoutRequest,
-  AuthApiError,
 } from "../api/authApi";
 import type { AuthUser } from "../api/authApi";
 
@@ -133,22 +132,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ready,
       authFetch,
       async login(email, password) {
-        try {
-          const data = await apiLogin(email, password);
-          persistSession(data.access, data.refresh, data.user);
-        } catch (err) {
-          throw err instanceof AuthApiError ? err : new AuthApiError("Login failed", 0);
-        }
+        // No try/catch here on purpose: apiLogin already throws AuthApiError
+        // for API errors, and a raw network failure throws its own Error.
+        // AuthModal tells them apart (instanceof AuthApiError) to pick between
+        // the API's specific message and the translated generic one — wrapping
+        // errors here would only get in the way of that, as it used to (a
+        // hardcoded English "Login failed" was leaking past the translations).
+        const data = await apiLogin(email, password);
+        persistSession(data.access, data.refresh, data.user);
       },
       async register(email, password, displayName) {
-        try {
-          // Registering no longer logs the user in — the account needs email
-          // verification first (see accounts.views.RegisterView).
-          const data = await apiRegister(email, password, displayName);
-          return { email: data.email };
-        } catch (err) {
-          throw err instanceof AuthApiError ? err : new AuthApiError("Register failed", 0);
-        }
+        // Registering no longer logs the user in — the account needs email
+        // verification first (see accounts.views.RegisterView). See login()
+        // above for why errors aren't caught/rewrapped here either.
+        const data = await apiRegister(email, password, displayName);
+        return { email: data.email };
       },
       async logout() {
         const refresh = tokens.current.refresh;

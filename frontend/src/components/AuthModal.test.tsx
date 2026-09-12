@@ -146,4 +146,33 @@ describe("AuthModal", () => {
 
     expect(await screen.findByText("Ocurrió un error. Revisá los datos e intentá de nuevo.")).toBeInTheDocument();
   });
+
+  it("un fallo de red en login muestra el mensaje genérico TRADUCIDO, no un texto en inglés hardcodeado", async () => {
+    const user = userEvent.setup();
+    // A raw network failure — fetch itself throwing — not an AuthApiError
+    // from the API. Regression test for a bug where AuthContext used to
+    // rewrap this into a hardcoded English "Login failed", bypassing i18n.
+    vi.mocked(authApi.login).mockRejectedValue(new TypeError("Failed to fetch"));
+    renderModal();
+
+    await user.type(screen.getByLabelText("Email"), "carlos@example.com");
+    await user.type(screen.getByLabelText("Contraseña"), "supersecreta123");
+    await user.click(screen.getByRole("button", { name: "Entrar" }));
+
+    expect(await screen.findByText("Ocurrió un error. Revisá los datos e intentá de nuevo.")).toBeInTheDocument();
+    expect(screen.queryByText(/login failed/i)).not.toBeInTheDocument();
+  });
+
+  it("un fallo de red en registro muestra el mensaje genérico TRADUCIDO, no un texto en inglés hardcodeado", async () => {
+    const user = userEvent.setup();
+    vi.mocked(authApi.register).mockRejectedValue(new TypeError("Failed to fetch"));
+    renderModal("register");
+
+    await user.type(screen.getByLabelText("Email"), "nuevo@example.com");
+    await user.type(screen.getByLabelText("Contraseña"), "supersecreta123");
+    await user.click(screen.getByRole("button", { name: "Crear cuenta" }));
+
+    expect(await screen.findByText("Ocurrió un error. Revisá los datos e intentá de nuevo.")).toBeInTheDocument();
+    expect(screen.queryByText(/register failed/i)).not.toBeInTheDocument();
+  });
 });
