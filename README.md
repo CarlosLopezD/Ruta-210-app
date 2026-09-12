@@ -74,19 +74,59 @@ personal.
   confirmación), y hay un flujo de "olvidé mi contraseña" por email. Login
   con rate limiting por IP y bloqueo temporal de la cuenta tras intentos
   fallidos repetidos.
+- **Refresh token en cookie httpOnly** — el access token JWT vive solo en
+  memoria (nunca en localStorage), y el refresh token viaja únicamente en
+  una cookie `httpOnly` + `SameSite=Lax`, invisible a JavaScript (incluido un
+  eventual XSS). Ver [Autenticación y sesión](#autenticación-y-sesión) para
+  el detalle de cómo funciona esto sin necesitar un esquema de CSRF aparte.
+
+## Autenticación y sesión
+
+El access token JWT se guarda solo en una variable en memoria (se pierde al
+recargar la página, y se vuelve a pedir en silencio con el refresh token). El
+refresh token nunca es visible para JavaScript: vive únicamente en una cookie
+`httpOnly`, con scope acotado a `/api/auth/` y `SameSite=Lax`.
+
+`SameSite=Lax` alcanza como protección CSRF (sin necesitar un esquema de
+token de CSRF aparte) solo porque el frontend y el backend se sirven desde
+**el mismo origen** ante el navegador — si fueran orígenes distintos, la
+cookie necesitaría `SameSite=None`, y eso sí requeriría CSRF real. Por eso:
+
+- **En producción**, el frontend (`ruta-210-app.lcarlosdario2020.workers.dev`)
+  corre detrás de un **Cloudflare Worker** (`frontend/worker/index.ts`) que
+  actúa de reverse proxy: sirve el build estático para todo excepto `/api/*`,
+  que reenvía server-to-server al backend real en Render (configurado en
+  `frontend/wrangler.jsonc` vía `run_worker_first` + la variable
+  `API_ORIGIN`). Para el navegador, todo el tráfico —assets estáticos y
+  API— sale del mismo origen.
+- **En desarrollo local**, `npm run dev` hace lo mismo con el proxy nativo de
+  Vite (`server.proxy` en `frontend/vite.config.ts`): las llamadas a
+  `/api/*` desde `localhost:5173` se reenvían a `127.0.0.1:8000`. Por eso
+  `frontend/.env.example` trae `VITE_API_BASE_URL` vacío — si se apunta
+  directo al backend (otro origen), el login sigue funcionando pero el
+  refresh silencioso al recargar la página no, porque la cookie no viaja
+  cross-origin.
+
+Tokens: el access dura 60 minutos, el refresh 7 días y rota en cada uso (el
+anterior queda en una blacklist). No hay "recordarme" — pasados los 7 días
+hay que loguearse de nuevo.
 
 ## Estructura del proyecto
 
 ```
 backend/          API Django + DRF
-  accounts/        User propio (login por email), register/login/refresh/me (JWT)
+  accounts/        User propio (login por email), register/login/refresh/me (JWT + cookie)
   trips/           geocoding, ruteo, motor HOS, endpoint /plan/, CRUD del historial
+  config/          settings, checks de arranque en producción, endpoint de reset de demo
 frontend/          SPA React + Vite + TypeScript
   src/context/      Providers de Theme, Language y Auth
   src/pages/        PlannerPage (pública), HistoryPage ("Mis viajes", protegida)
+  worker/           Cloudflare Worker: reverse proxy de /api/* hacia el backend
+  wrangler.jsonc    Config del deploy en Cloudflare (assets + el Worker de arriba)
 docs/              capturas
 docker-compose.yml  Postgres local para desarrollo
 render.yaml        Blueprint de Render para el backend
+.github/workflows/  CI (tests + build) y el reset periódico de la demo
 ```
 
 ## Cómo correrlo en local
@@ -102,7 +142,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # los defaults andan bien — corre en SQLite sin configurar nada
 python manage.py migrate
-python manage.py test        # 53 tests: motor HOS, API de viajes, auth, historial, config
+python manage.py test        # 66 tests: motor HOS, API de viajes, auth, historial, config
 python manage.py runserver 8000
 ```
 
@@ -144,7 +184,7 @@ producción.
 ```bash
 cd frontend
 npm install
-cp .env.example .env          # VITE_API_BASE_URL=http://127.0.0.1:8000
+cp .env.example .env          # VITE_API_BASE_URL vacío — ver nota abajo
 npm run dev
 ```
 
@@ -152,6 +192,14 @@ Abrí http://localhost:5173, completá el formulario (o hacé click en **"Usar
 ejemplo"** para autocompletar un viaje de muestra), y hacé click en
 **Planificar viaje**. Creá una cuenta desde el header para probar guardar un
 viaje y la página de **Mis viajes**.
+
+> `VITE_API_BASE_URL` va vacío a propósito: `npm run dev` proxea `/api/*` al
+> backend en `127.0.0.1:8000` (ver `server.proxy` en `vite.config.ts`), así
+> que el navegador ve todo como un solo origen — lo mismo que hace el
+> Cloudflare Worker en producción, y por la misma razón: es lo que permite
+> que la cookie httpOnly del refresh token viaje (ver [Autenticación y
+> sesión](#autenticación-y-sesión)). Con el backend corriendo en el puerto
+> 8000 (el default de arriba), no hay que tocar nada más.
 
 > Geocoding (Nominatim) y ruteo (OSRM) llaman a servicios públicos y sin
 > API key sobre internet abierto — necesitan acceso de red saliente para
@@ -176,7 +224,7 @@ viaje y la página de **Mis viajes**.
 `start_datetime`, `pickup_duration_hours` y `dropoff_duration_hours` son
 todos opcionales — omitilos para obtener el comportamiento anterior (arranca
 "ahora", 1 hora para cada parada). Devuelve `{ summary, route, locations,
-stops, daily_logs } Errores: `400` por input inválido, `502`
+stops, daily_logs }`. Errores: `400` por input inválido, `502`
 si falla geocoding/ruteo.
 
 **Auth**: el registro ya no inicia sesión automáticamente — la cuenta queda
@@ -191,14 +239,17 @@ fallidos de login y rate limiting por IP en todos los endpoints de auth.
 - `POST /api/auth/resend-verification/` — `{ email }` → reenvía el email de
   verificación si la cuenta existe y todavía no está verificada. Responde
   `200` con un mensaje genérico en ambos casos (no revela si el email existe).
-- `POST /api/auth/login/` — `{ email, password }` → tokens + user. `401` por
-  credenciales inválidas; `400` con `code: "email_not_verified"` si la cuenta
-  no confirmó su email, o `code: "account_locked"` tras 5 intentos fallidos
-  (bloqueo de 15 minutos).
-- `POST /api/auth/refresh/` — `{ refresh }` → nuevo access token (los refresh
-  tokens rotan: cada uso invalida el anterior y devuelve uno nuevo).
-- `POST /api/auth/logout/` — `{ refresh }` (requiere `Authorization: Bearer
-  <access>`) → invalida (blacklist) el refresh token.
+- `POST /api/auth/login/` — `{ email, password }` → `{ access, user }` +
+  setea la cookie httpOnly del refresh token (nunca va en el body — ver
+  [Autenticación y sesión](#autenticación-y-sesión)). `401` por credenciales
+  inválidas; `400` con `code: "email_not_verified"` si la cuenta no confirmó
+  su email, o `code: "account_locked"` tras 5 intentos fallidos (bloqueo de
+  15 minutos).
+- `POST /api/auth/refresh/` — sin body: lee el refresh token de la cookie
+  httpOnly → `{ access }` y renueva esa misma cookie (rota en cada uso, el
+  anterior queda blacklisteado). `401` si no hay cookie o es inválida/venció.
+- `POST /api/auth/logout/` — sin body (requiere `Authorization: Bearer
+  <access>`) → invalida (blacklist) el refresh token de la cookie y la borra.
 - `POST /api/auth/password-reset/` — `{ email }` → envía un link de reset si
   la cuenta existe. Mismo mensaje genérico que `resend-verification`.
 - `POST /api/auth/password-reset/confirm/` — `{ uid, token, new_password }` →
@@ -218,6 +269,24 @@ todos scoped al usuario autenticado):
   el `plan_result` completo actualizado, no un diff).
 - `DELETE /api/trips/history/<id>/` — borra un viaje guardado.
 
+**Mantenimiento de la demo pública**:
+- `POST /api/system/reset-demo/` — borra **todos** los datos (cuentas y
+  viajes, ver [Datos de la demo pública](#datos-de-la-demo-pública)).
+  Requiere un header `X-Reset-Token` que matchee `DEMO_RESET_TOKEN`; sin ese
+  header, o si la variable no está configurada en el deploy, devuelve `403`
+  siempre. No pensado para llamarse desde el frontend.
+
+## Datos de la demo pública
+
+Esto es un proyecto de portfolio con una demo pública, no un producto con
+usuarios reales — así que **cada ~30 minutos se borran todas las cuentas y
+todos los viajes** guardados en la instancia de producción
+(`ruta-210-app.lcarlosdario2020.workers.dev`), vía un
+[workflow de GitHub Actions](.github/workflows/reset-demo-data.yml)
+programado que llama a `POST /api/system/reset-demo/`. Si estás evaluando
+este proyecto y tu cuenta de prueba desaparece, es por esto, no un bug — el
+horario del workflow (aproximado, GitHub no garantiza el minuto exacto) está
+en `.github/workflows/reset-demo-data.yml`.
 
 ## Limitaciones conocidas
 
@@ -234,13 +303,19 @@ todos scoped al usuario autenticado):
   un archivo en disco, sin setup extra. En producción (`DJANGO_DEBUG=False`)
   el backend ahora **exige** `DATABASE_URL` y no arranca sin ella, en vez de
   caer silenciosamente a un SQLite que la mayoría de los hosts gratuitos
-  (Render incluido) borran en cada redeploy.
+  (Render incluido) borran en cada redeploy. En producción usa Postgres en
+  [Neon](https://neon.tech) (plan free) — Neon pausa el compute tras un rato
+  de inactividad; la primera consulta después de eso puede tardar unos
+  segundos extra en lo que arranca de nuevo, sin perder datos.
+- Ver [Datos de la demo pública](#datos-de-la-demo-pública) — todo se borra
+  automáticamente cada ~30 minutos en la instancia pública.
 - Los access tokens JWT duran 60 minutos, los refresh tokens 7 días; no hay
-  "recordarme" / sesión de más larga duración que eso.
+  "recordarme" / sesión de más larga duración que eso (ver [Autenticación y
+  sesión](#autenticación-y-sesión)).
 
 ## Tests
 
-Backend (53 tests):
+Backend (66 tests):
 
 ```bash
 cd backend && source .venv/bin/activate && python manage.py test -v 2
@@ -251,21 +326,29 @@ cd backend && source .venv/bin/activate && python manage.py test -v 2
 combustible cada ≤1.000 millas, el reset de 70 horas del ciclo, duración
 configurable de carga/descarga, hora de inicio opcional, guardar/listar/
 actualizar status/borrar/actualizar anotaciones y — lo más importante — que
-un usuario nunca puede ver ni modificar los viajes de otro), 21 de auth
+un usuario nunca puede ver ni modificar los viajes de otro), 28 de auth
 (register/login/me/logout, verificación de email, recuperación de
-contraseña, bloqueo de cuenta tras intentos fallidos, rate limiting), y 9
-que confirman que el arranque en producción falla explícito si falta
+contraseña, bloqueo de cuenta tras intentos fallidos, rate limiting, la
+cookie httpOnly del refresh token y su rotación/blacklist), y 15 en `config`
+— 9 que confirman que el arranque en producción falla explícito si falta
 `DJANGO_SECRET_KEY` o `DATABASE_URL` en vez de usar un fallback inseguro o
-silencioso. Los tests mockean geocoding/ruteo para correr offline y de
-forma determinística.
+silencioso, y 6 para el endpoint de reset de la demo (que se niega siempre
+si `DEMO_RESET_TOKEN` no está configurado, incluso con un header vacío, y
+que efectivamente borra todo con el token correcto). Los tests mockean
+geocoding/ruteo para correr offline y de forma determinística.
 
-Frontend:
+Frontend (21 tests):
 
 ```bash
 cd frontend && npm test -- --run
 ```
 
 Tests de componentes (Vitest + Testing Library) para el modal de
-autenticación: login, registro, verificación pendiente, reenvío de
-verificación y recuperación de contraseña, incluyendo los mensajes de error
-genéricos vs. los específicos que devuelve la API.
+autenticación (login, registro, verificación pendiente, reenvío de
+verificación y recuperación de contraseña, mensajes de error genéricos vs.
+específicos) y para `AuthContext` (arranque de sesión con/sin usuario
+cacheado, refresh silencioso vía cookie, qué pasa si ese refresh falla por
+sesión vencida vs. por un error de red, login/logout, reintento automático
+de una request que dio 401). Más 4 tests de unidad, sin dependencias de
+Cloudflare, para la función pura que arma la URL upstream del Worker
+(`frontend/worker/index.test.ts`).

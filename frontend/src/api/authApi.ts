@@ -1,4 +1,12 @@
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://127.0.0.1:8000";
+// Empty string (same origin) is the right default in every environment now:
+// production goes through the Cloudflare Worker proxy (frontend/worker/),
+// and `npm run dev` proxies /api/* itself (see vite.config.ts) — both exist
+// specifically so the httpOnly refresh-token cookie is sent same-site. Only
+// falls back to a literal URL if VITE_API_BASE_URL is entirely unset (e.g.
+// someone runs the built app without ever copying .env.example), and even
+// then this must never become a *cross-origin* fallback — see the comment
+// on `credentials: "same-origin"` in postJson below for why.
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
 
 export interface AuthUser {
   id: number;
