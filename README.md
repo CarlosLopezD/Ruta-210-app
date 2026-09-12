@@ -3,9 +3,8 @@
 Proyecto personal de portfolio: una app full-stack que toma los datos de
 pickup/dropoff de un viaje y las horas del ciclo HOS que el conductor ya
 tiene usadas, y devuelve una ruta más las **Daily Log Sheets** (ELD)
-generadas automáticamente. Arrancó como ejercicio técnico de Full Stack
-Developer y siguió creciendo como proyecto propio, con varias funcionalidades
-agregadas después
+generadas automáticamente, con varias funcionalidades agregadas después de
+la versión inicial.
 
 **Stack:** Django + Django REST Framework (backend) · React + Vite +
 TypeScript (frontend) · OSRM para el ruteo · Nominatim (OpenStreetMap) para
