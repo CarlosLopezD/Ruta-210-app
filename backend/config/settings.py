@@ -200,3 +200,14 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", "Ruta 210 App <onboarding@resend.dev>"
 # Base URL of the deployed frontend — used to build the links inside those
 # emails (e.g. https://ruta-210-app.example.workers.dev/verificar-email?...).
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
+# --- Demo data reset ----------------------------------------------------------
+# This is a portfolio demo, not a real product with real users — see
+# config/views.py's ResetDemoDataView, wired up on a schedule via
+# .github/workflows/reset-demo-data.yml, which wipes every account and trip
+# periodically so the public demo doesn't accumulate other people's test data.
+# Empty by default (and MUST stay that way unless explicitly configured): the
+# view refuses every request outright when this is blank, so a fork or a
+# fresh deploy that never set this env var can't have its database wiped by
+# a stranger who guesses the endpoint.
+DEMO_RESET_TOKEN = os.environ.get("DEMO_RESET_TOKEN", "")

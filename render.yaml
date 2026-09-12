@@ -33,3 +33,10 @@ services:
         sync: false
       - key: EMAIL_FROM
         value: "Ruta 210 App <onboarding@resend.dev>"
+      # Shared secret for POST /api/system/reset-demo/ (see backend/config/views.py)
+      # — a scheduled GitHub Actions workflow calls it every 30 min to wipe the
+      # demo database. Render generates a random value; copy it from the
+      # dashboard into this repo's GitHub secret also named DEMO_RESET_TOKEN
+      # (Settings → Secrets and variables → Actions) so the workflow can send it.
+      - key: DEMO_RESET_TOKEN
+        generateValue: true

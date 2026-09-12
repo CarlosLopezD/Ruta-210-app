@@ -1,0 +1,33 @@
+name: Reset demo database
+
+# This is a portfolio demo, not a product with real users to protect — this
+# wipes every account and trip on a schedule so the public instance doesn't
+# accumulate other people's test data. See backend/config/views.py
+# (ResetDemoDataView) for what actually runs on the backend.
+#
+# GitHub's cron scheduler is best-effort, not exact — during busy periods a
+# run can be delayed by several minutes, so "every 30 minutes" here means
+# "approximately", which is fine for this purpose.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  # Lets you fire it by hand from the Actions tab, e.g. right before showing
+  # the app to someone.
+  workflow_dispatch: {}
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the reset endpoint
+        run: |
+          # --max-time 90: Render's free plan spins the backend down after
+          # inactivity, and the first request after that can take 30-50s to
+          # wake it back up — give it room instead of timing out on a cold start.
+          # -f: fail (non-zero exit, red run in the Actions tab) on a 4xx/5xx
+          # response, e.g. if DEMO_RESET_TOKEN drifts out of sync between
+          # this repo's secret and the Render env var.
+          curl --fail --max-time 90 --silent --show-error \
+            -X POST "https://eld-trip-planner-api-wkzt.onrender.com/api/system/reset-demo/" \
+            -H "X-Reset-Token: ${{ secrets.DEMO_RESET_TOKEN }}" \
+            -o /dev/null -w "HTTP %{http_code}\n"
