@@ -9,7 +9,6 @@ export interface AuthUser {
 
 export interface AuthResponse {
   access: string;
-  refresh: string;
   user: AuthUser;
 }
 
@@ -54,11 +53,21 @@ async function parseError(response: Response): Promise<AuthApiError> {
   return new AuthApiError(`Error ${response.status}`, response.status);
 }
 
-async function postJson<T>(path: string, payload: unknown): Promise<T> {
+async function postJson<T>(path: string, payload?: unknown): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    // "same-origin" is fetch's own default — spelled out here because it's
+    // load-bearing: the refresh token now travels only as an httpOnly
+    // cookie (see login/refreshAccessToken/logoutRequest below), and this
+    // is what makes the browser attach and accept it. It only works because
+    // the frontend's own Cloudflare Worker proxies /api/* to the backend
+    // (see frontend/worker/), so this really is a same-origin request from
+    // the browser's point of view — this must never become "include" to
+    // paper over a cross-origin API URL, that would need real CSRF
+    // protection, which nothing here implements.
+    credentials: "same-origin",
+    headers: payload !== undefined ? { "Content-Type": "application/json" } : undefined,
+    body: payload !== undefined ? JSON.stringify(payload) : undefined,
   });
   if (!response.ok) throw await parseError(response);
   if (response.status === 205) return undefined as T;
@@ -73,18 +82,17 @@ export function register(email: string, password: string, display_name?: string)
   return postJson("/api/auth/register/", { email, password, display_name: display_name ?? "" });
 }
 
-export function refreshAccessToken(refresh: string): Promise<{ access: string; refresh?: string }> {
-  return postJson("/api/auth/refresh/", { refresh });
+// No refresh token argument: it lives only in the httpOnly cookie the
+// browser already attaches to this request (see postJson above).
+export function refreshAccessToken(): Promise<{ access: string }> {
+  return postJson("/api/auth/refresh/");
 }
 
-export function logoutRequest(refresh: string, accessToken: string | null): Promise<void> {
+export function logoutRequest(accessToken: string | null): Promise<void> {
   return fetch(`${API_BASE_URL}/api/auth/logout/`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-    },
-    body: JSON.stringify({ refresh }),
+    credentials: "same-origin",
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
   }).then(() => undefined); // best-effort — logout clears the local session either way
 }
 

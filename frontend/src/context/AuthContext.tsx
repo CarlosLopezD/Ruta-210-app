@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import type { ReactNode } from "react";
 import {
   API_BASE_URL,
+  AuthApiError,
   login as apiLogin,
   register as apiRegister,
   refreshAccessToken,
@@ -9,8 +10,16 @@ import {
 } from "../api/authApi";
 import type { AuthUser } from "../api/authApi";
 
-const ACCESS_KEY = "eld-trip-planner:access";
-const REFRESH_KEY = "eld-trip-planner:refresh";
+// The refresh token is never stored here at all anymore — it lives only in
+// an httpOnly cookie the browser manages, invisible to this (or any) script.
+// The access token isn't persisted either; it lives only in the `accessToken`
+// ref below, in memory. On a full page reload that memory is gone, so we
+// silently ask /api/auth/refresh/ for a new one using the cookie (see the
+// boot effect) instead of trusting anything read back from storage.
+//
+// USER_KEY is the one thing still cached: it's profile info, not a
+// credential, so keeping it lets a returning user see their name
+// immediately instead of a loading flicker while that silent refresh runs.
 const USER_KEY = "eld-trip-planner:user";
 
 function readStorage(key: string): string | null {
@@ -49,48 +58,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   });
   const [ready, setReady] = useState(false);
 
-  // Tokens live in a ref (not state) so authFetch always reads the latest
-  // value without re-creating the callback on every render.
-  const tokens = useRef({ access: readStorage(ACCESS_KEY), refresh: readStorage(REFRESH_KEY) });
+  // In-memory only (see the module-level comment above) — not a ref that
+  // mirrors storage, the ONLY copy of the access token there is.
+  const accessToken = useRef<string | null>(null);
 
-  function persistSession(access: string, refresh: string, nextUser: AuthUser) {
-    tokens.current = { access, refresh };
-    writeStorage(ACCESS_KEY, access);
-    writeStorage(REFRESH_KEY, refresh);
+  function persistSession(access: string, nextUser: AuthUser) {
+    accessToken.current = access;
     writeStorage(USER_KEY, JSON.stringify(nextUser));
     setUser(nextUser);
   }
 
   function clearSession() {
-    tokens.current = { access: null, refresh: null };
-    writeStorage(ACCESS_KEY, null);
-    writeStorage(REFRESH_KEY, null);
+    accessToken.current = null;
     writeStorage(USER_KEY, null);
     setUser(null);
   }
 
   async function authFetch(path: string, options: RequestInit = {}): Promise<Response> {
-    const doFetch = (accessToken: string | null) =>
+    const doFetch = (token: string | null) =>
       fetch(`${API_BASE_URL}${path}`, {
         ...options,
+        credentials: "same-origin",
         headers: {
           ...(options.body ? { "Content-Type": "application/json" } : {}),
           ...(options.headers ?? {}),
-          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
 
-    let response = await doFetch(tokens.current.access);
+    let response = await doFetch(accessToken.current);
 
-    if (response.status === 401 && tokens.current.refresh) {
+    if (response.status === 401) {
       try {
-        // Refresh tokens rotate server-side (SIMPLE_JWT.ROTATE_REFRESH_TOKENS):
-        // every use returns a NEW refresh token and blacklists the old one,
-        // so we must persist the one we get back or the *next* refresh fails.
-        const { access, refresh: rotated } = await refreshAccessToken(tokens.current.refresh);
-        tokens.current = { access, refresh: rotated ?? tokens.current.refresh };
-        writeStorage(ACCESS_KEY, access);
-        if (rotated) writeStorage(REFRESH_KEY, rotated);
+        // The refresh token itself isn't handled here at all — it's an
+        // httpOnly cookie the browser already attached to that request.
+        const { access } = await refreshAccessToken();
+        accessToken.current = access;
         response = await doFetch(access);
       } catch {
         clearSession();
@@ -101,13 +104,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   useEffect(() => {
-    // Validate any persisted session once on load; drop it if it no longer works.
+    // A cached user is just a display hint (see USER_KEY comment above) —
+    // if there isn't one, this was never a logged-in session, so skip the
+    // round-trip entirely and land on "logged out" immediately.
+    if (!readStorage(USER_KEY)) {
+      setReady(true);
+      return;
+    }
     (async () => {
-      if (!tokens.current.access && !tokens.current.refresh) {
-        setReady(true);
-        return;
-      }
       try {
+        // No access token survives a reload, so the session is re-derived
+        // from scratch: ask for a fresh access token using the refresh
+        // cookie, then fetch the current user with it.
+        const { access } = await refreshAccessToken();
+        accessToken.current = access;
         const response = await authFetch("/api/auth/me/");
         if (response.ok) {
           const freshUser = (await response.json()) as AuthUser;
@@ -116,8 +126,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } else {
           clearSession();
         }
-      } catch {
-        // network error on boot — keep whatever we had cached, don't log out
+      } catch (err) {
+        // A 401 here means the refresh cookie is missing/expired/invalid —
+        // there's genuinely no session anymore, so drop the cached display.
+        // Anything else (network hiccup, backend briefly down) keeps
+        // whatever was cached rather than bouncing the user to "logged out".
+        if (err instanceof AuthApiError && err.status === 401) {
+          clearSession();
+        }
       } finally {
         setReady(true);
       }
@@ -139,7 +155,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // errors here would only get in the way of that, as it used to (a
         // hardcoded English "Login failed" was leaking past the translations).
         const data = await apiLogin(email, password);
-        persistSession(data.access, data.refresh, data.user);
+        persistSession(data.access, data.user);
       },
       async register(email, password, displayName) {
         // Registering no longer logs the user in — the account needs email
@@ -149,15 +165,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return { email: data.email };
       },
       async logout() {
-        const refresh = tokens.current.refresh;
-        const access = tokens.current.access;
+        const access = accessToken.current;
         clearSession();
-        if (refresh) {
-          try {
-            await logoutRequest(refresh, access);
-          } catch {
-            // best-effort — the local session is already cleared either way
-          }
+        try {
+          // The backend reads the refresh token from the cookie itself and
+          // clears it server-side (blacklist + delete the cookie) — nothing
+          // to pass here besides the access token, for the Authorization header.
+          await logoutRequest(access);
+        } catch {
+          // best-effort — the local session is already cleared either way
         }
       },
     }),

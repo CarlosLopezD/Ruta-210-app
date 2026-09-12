@@ -66,7 +66,6 @@ describe("AuthModal", () => {
     const user = userEvent.setup();
     vi.mocked(authApi.login).mockResolvedValue({
       access: "access-token",
-      refresh: "refresh-token",
       user: { id: 1, email: "carlos@example.com", display_name: "Carlos", is_email_verified: true },
     });
     const { onClose, onSuccess } = renderModal();

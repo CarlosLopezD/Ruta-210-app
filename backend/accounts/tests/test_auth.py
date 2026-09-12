@@ -67,8 +67,30 @@ class LoginTests(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertIn("access", body)
-        self.assertIn("refresh", body)
         self.assertEqual(body["user"]["email"], "login@example.com")
+
+    def test_login_does_not_put_refresh_token_in_the_response_body(self):
+        # The refresh token must only ever leave the server as an httpOnly
+        # cookie — if it's in the JSON body, frontend JS (and thus an XSS
+        # payload) can read it.
+        response = self.client.post(
+            "/api/auth/login/",
+            data={"email": "login@example.com", "password": "supersecreta123"},
+            content_type="application/json",
+        )
+        self.assertNotIn("refresh", response.json())
+
+    def test_login_sets_httponly_refresh_cookie(self):
+        response = self.client.post(
+            "/api/auth/login/",
+            data={"email": "login@example.com", "password": "supersecreta123"},
+            content_type="application/json",
+        )
+        cookie = response.cookies["refresh_token"]
+        self.assertTrue(cookie.value)
+        self.assertEqual(cookie["httponly"], True)
+        self.assertEqual(cookie["samesite"], "Lax")
+        self.assertEqual(cookie["path"], "/api/auth/")
 
     def test_login_with_wrong_password_returns_401(self):
         response = self.client.post(
@@ -256,31 +278,78 @@ class LogoutTests(TestCase):
             data={"email": "logout@example.com", "password": "supersecreta123"},
             content_type="application/json",
         )
-        self.tokens = login.json()
+        self.access = login.json()["access"]
+        # self.client persists cookies across requests like a real browser,
+        # so the refresh_token cookie set by login above is already attached
+        # to every subsequent self.client.post() in these tests below.
 
     def test_logout_blacklists_refresh_token(self):
         response = self.client.post(
             "/api/auth/logout/",
-            data={"refresh": self.tokens["refresh"]},
-            content_type="application/json",
-            HTTP_AUTHORIZATION=f"Bearer {self.tokens['access']}",
+            HTTP_AUTHORIZATION=f"Bearer {self.access}",
         )
         self.assertEqual(response.status_code, 205)
 
-        # The blacklisted refresh token can no longer mint new access tokens.
-        refresh_response = self.client.post(
-            "/api/auth/refresh/",
-            data={"refresh": self.tokens["refresh"]},
-            content_type="application/json",
-        )
+        # The blacklisted refresh token (still in self.client's cookie jar)
+        # can no longer mint new access tokens.
+        refresh_response = self.client.post("/api/auth/refresh/")
         self.assertEqual(refresh_response.status_code, 401)
 
-    def test_logout_requires_auth(self):
+    def test_logout_clears_the_refresh_cookie(self):
         response = self.client.post(
             "/api/auth/logout/",
-            data={"refresh": self.tokens["refresh"]},
+            HTTP_AUTHORIZATION=f"Bearer {self.access}",
+        )
+        cookie = response.cookies["refresh_token"]
+        # Django expires a cleared cookie in the past / with an empty value —
+        # either is fine, the point is the browser won't keep sending it.
+        self.assertEqual(cookie.value, "")
+
+    def test_logout_requires_auth(self):
+        response = self.client.post("/api/auth/logout/")
+        self.assertEqual(response.status_code, 401)
+
+
+class TokenRefreshTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            email="refresh@example.com", password="supersecreta123", is_email_verified=True
+        )
+        login = self.client.post(
+            "/api/auth/login/",
+            data={"email": "refresh@example.com", "password": "supersecreta123"},
             content_type="application/json",
         )
+        self.original_refresh_cookie = login.cookies["refresh_token"].value
+
+    def test_refresh_reads_the_cookie_and_returns_only_an_access_token(self):
+        # self.client already carries the refresh_token cookie set by login
+        # in setUp — no body needed, unlike the old {"refresh": ...} flow.
+        response = self.client.post("/api/auth/refresh/")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("access", body)
+        self.assertNotIn("refresh", body)
+
+    def test_refresh_rotates_the_cookie(self):
+        response = self.client.post("/api/auth/refresh/")
+        rotated_value = response.cookies["refresh_token"].value
+        self.assertTrue(rotated_value)
+        self.assertNotEqual(rotated_value, self.original_refresh_cookie)
+
+    def test_old_refresh_token_is_blacklisted_after_rotation(self):
+        self.client.post("/api/auth/refresh/")  # rotates — self.client now holds the new cookie
+
+        # Manually replay the ORIGINAL (now-superseded) refresh token, the
+        # way a stolen/duplicated cookie would.
+        self.client.cookies["refresh_token"] = self.original_refresh_cookie
+        replay_response = self.client.post("/api/auth/refresh/")
+        self.assertEqual(replay_response.status_code, 401)
+
+    def test_refresh_without_a_cookie_returns_401(self):
+        self.client.cookies.clear()
+        response = self.client.post("/api/auth/refresh/")
         self.assertEqual(response.status_code, 401)
 
 

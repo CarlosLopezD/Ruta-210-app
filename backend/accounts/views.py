@@ -2,10 +2,11 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
-from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from .cookies import REFRESH_COOKIE_NAME, clear_refresh_cookie, set_refresh_cookie
 from .emails import send_password_reset_email, send_verification_email
 from .serializers import (
     EmailTokenObtainPairSerializer,
@@ -27,6 +28,48 @@ class LoginView(TokenObtainPairView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth-login"
+
+    def post(self, request, *args, **kwargs):
+        # SimpleJWT's default post() puts {access, refresh, ...} straight in
+        # the JSON body. We instead move the refresh token into an httpOnly
+        # cookie (see accounts/cookies.py) so it's never reachable from
+        # frontend JavaScript — only the access token and user stay in the body.
+        response = super().post(request, *args, **kwargs)
+        refresh = response.data.pop("refresh", None)
+        if refresh is not None:
+            set_refresh_cookie(response, refresh)
+        return response
+
+
+class CookieTokenRefreshView(TokenRefreshView):
+    """Like SimpleJWT's TokenRefreshView, but reads the refresh token from
+    the httpOnly cookie instead of the request body, and — since
+    ROTATE_REFRESH_TOKENS is on — writes the rotated refresh token back to
+    that same cookie instead of returning it in the JSON body."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        refresh = request.COOKIES.get(REFRESH_COOKIE_NAME)
+        if not refresh:
+            return Response(
+                {"detail": "No se encontró una sesión para renovar. Iniciá sesión de nuevo."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        serializer = self.get_serializer(data={"refresh": refresh})
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as exc:
+            # Expired, blacklisted, or otherwise invalid — same outcome as a
+            # missing cookie from the caller's point of view: log in again.
+            raise InvalidToken(exc.args[0]) from exc
+
+        response = Response({"access": serializer.validated_data["access"]}, status=status.HTTP_200_OK)
+        rotated_refresh = serializer.validated_data.get("refresh")
+        if rotated_refresh:
+            set_refresh_cookie(response, rotated_refresh)
+        return response
 
 
 class RegisterView(generics.CreateAPIView):
@@ -119,13 +162,15 @@ class LogoutView(APIView):
     throttle_scope = "auth-login"
 
     def post(self, request):
-        refresh = request.data.get("refresh")
+        refresh = request.COOKIES.get(REFRESH_COOKIE_NAME)
         if refresh:
             try:
                 RefreshToken(refresh).blacklist()
             except TokenError:
                 pass  # already invalid/expired/blacklisted — logout still "succeeds"
-        return Response(status=status.HTTP_205_RESET_CONTENT)
+        response = Response(status=status.HTTP_205_RESET_CONTENT)
+        clear_refresh_cookie(response)
+        return response
 
 
 class MeView(APIView):
